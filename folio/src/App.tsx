@@ -177,6 +177,7 @@ function App() {
       try {
         const model = await engine.open(bytes, name, suppliedPassword);
         setDocumentModel(model);
+        setFontVersion((version) => version + 1);
         fittedPage.current = "";
         setPageIndex(0);
         setOperations([]);
@@ -912,7 +913,9 @@ function TextInspector({
   const [text, setText] = useState(existing?.text ?? original?.text ?? "");
   const initialFont =
     existing?.fontId ??
-    (original ? suggestedFontId(original.fontName) : "inter");
+    (original?.fontId ??
+      (original ? suggestedFontId(original.fontName) : "inter") ??
+      "");
   const [fontId, setFontId] = useState(initialFont);
   const [fontSize, setFontSize] = useState(
     existing?.fontSize ?? original?.fontSize ?? 16,
@@ -925,9 +928,13 @@ function TextInspector({
   );
   const [validationError, setValidationError] = useState("");
   const [validating, setValidating] = useState(false);
-  const chosen = fonts.find((font) => font.id === fontId) ?? fonts[0];
+  const chosen = fonts.find((font) => font.id === fontId);
   const preserve = original
-    ? canPreserveOriginal(original.fontName, fontId)
+    ? Boolean(
+        chosen &&
+          (chosen.id === original.fontId ||
+        canPreserveOriginal(original.fontName, fontId))
+      )
     : false;
   if (original && !original.editable)
     return (
@@ -938,6 +945,12 @@ function TextInspector({
       </div>
     );
   const apply = async () => {
+    if (!chosen) {
+      setValidationError(
+        "Choose a font. Upload the matching TTF/OTF to preserve an unavailable original face.",
+      );
+      return;
+    }
     if (
       !Number.isFinite(fontSize) ||
       fontSize < 4 ||
@@ -1032,8 +1045,12 @@ function TextInspector({
           {preserve ? <Check size={14} /> : <AlertCircle size={14} />}
           <span>
             {preserve
-              ? `Using a matching PDF base font for ${original.fontName}.`
-              : `${original.fontName} is embedded or unavailable. Export will use ${chosen.family}; preview this change before exporting.`}
+              ? chosen?.documentFontKey
+                ? `${original.fontAvailabilityReason}. New text is checked against the exact embedded glyphs before applying.`
+                : `Using the exact PDF base font for ${original.fontName}.`
+              : chosen
+                ? `Using ${chosen.family} as an explicit replacement for ${original.fontName}.`
+                : original.fontAvailabilityReason}
           </span>
         </div>
       )}
@@ -1086,6 +1103,7 @@ function TextInspector({
         className="primary inspector-apply"
         disabled={
           validating ||
+          !chosen ||
           !Number.isFinite(fontSize) ||
           fontSize < 4 ||
           fontSize > 144 ||
@@ -1229,7 +1247,7 @@ function FontPicker({
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const selected = fonts.find((font) => font.id === value) ?? fonts[0];
+  const selected = fonts.find((font) => font.id === value);
   const matches = fonts.filter((font) =>
     `${font.family} ${font.category} ${font.coverage}`
       .toLowerCase()
@@ -1243,7 +1261,13 @@ function FontPicker({
         onClick={() => setOpen((current) => !current)}
         aria-expanded={open}
       >
-        <span style={{ fontFamily: selected.family }}>{selected.family}</span>
+        <span
+          style={{
+            fontFamily: selected?.documentFontKey ? undefined : selected?.family,
+          }}
+        >
+          {selected?.family ?? "Choose or upload a font…"}
+        </span>
         <ChevronDown size={15} />
       </button>
       {open && (
@@ -1269,9 +1293,17 @@ function FontPicker({
                   setQuery("");
                 }}
               >
-                <span style={{ fontFamily: font.family }}>{font.family}</span>
+                <span
+                  style={{
+                    fontFamily: font.documentFontKey ? undefined : font.family,
+                  }}
+                >
+                  {font.family}
+                </span>
                 <small>
-                  {font.category} · {font.coverage}
+                  {font.documentFontKey
+                    ? `Original PDF only · ${font.coverage}`
+                    : `${font.category} · ${font.coverage}`}
                 </small>
               </button>
             ))}

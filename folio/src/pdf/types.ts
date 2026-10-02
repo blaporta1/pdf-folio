@@ -7,6 +7,9 @@ export interface TextElement {
   rect: Rect;
   text: string;
   fontName: string;
+  fontId?: string;
+  fontExactAvailable: boolean;
+  fontAvailabilityReason?: string;
   fontSize: number;
   baseline: number;
   color: string;
@@ -85,6 +88,9 @@ export interface FontDefinition {
   base14?: string;
   bytes?: Uint8Array;
   uploaded?: boolean;
+  documentFontKey?: string;
+  exactOriginal?: boolean;
+  subset?: boolean;
   coverage: string;
 }
 

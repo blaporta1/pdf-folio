@@ -303,7 +303,7 @@ export function validateAndCreateUploadedFont(
 
 export function suggestedFontId(originalName: string) {
   const exact = matchingBaseFont(originalName);
-  return exact?.id ?? "inter";
+  return exact?.id;
 }
 
 export function canPreserveOriginal(

@@ -9,8 +9,9 @@ import mupdf, {
   type PDFPage,
   type Quad,
   type Rect as MuRect,
+  type Text,
 } from "mupdf";
-import { allFonts, loadFont } from "./fonts";
+import { allFonts, loadFont, suggestedFontId } from "./fonts";
 import type {
   DocumentModel,
   EditOperation,
@@ -23,6 +24,29 @@ import type {
 } from "./types";
 
 const MAX_FILE_BYTES = 150 * 1024 * 1024;
+
+interface DocumentFontRecord {
+  key: string;
+  definition: FontDefinition;
+  font: Font;
+  glyphs: Map<number, number>;
+  ambiguousGlyphs: Set<number>;
+  pdfObjectNumber?: number;
+  characterCodes?: Map<number, Uint8Array>;
+}
+
+interface ResourceFontInfo {
+  fontName: string;
+  objectNumber?: number;
+  characterCodes: Map<number, Uint8Array>;
+}
+
+interface CapturedGlyph {
+  x: number;
+  y: number;
+  codePoint: number;
+  record: DocumentFontRecord;
+}
 
 export class PasswordRequiredError extends Error {
   constructor(public readonly invalid = false) {
@@ -38,13 +62,18 @@ export class PdfEngine {
   private originalBytes: Uint8Array | null = null;
   private password = "";
   private customFonts: FontDefinition[] = [];
+  private documentFonts = new Map<string, DocumentFontRecord>();
+  private documentFontSequence = 0;
 
   addFont(font: FontDefinition) {
     this.customFonts = [...this.customFonts, font];
   }
 
   getFonts() {
-    return allFonts(this.customFonts);
+    return [
+      ...Array.from(this.documentFonts.values(), (record) => record.definition),
+      ...allFonts(this.customFonts),
+    ];
   }
 
   async validateText(
@@ -55,9 +84,15 @@ export class PdfEngine {
   ) {
     const definition = this.getFonts().find((font) => font.id === fontId);
     if (!definition) throw new Error("Choose an available font.");
-    const font = await loadFont(definition);
+    const acquired = await this.acquireFont(definition);
     try {
-      const lines = layoutLines(font, text, Math.max(1, width), fontSize);
+      const lines = layoutLines(
+        acquired.font,
+        text,
+        Math.max(1, width),
+        fontSize,
+        acquired.resolveGlyph,
+      );
       return {
         lines,
         requiredHeight: Math.max(
@@ -66,7 +101,7 @@ export class PdfEngine {
         ),
       };
     } finally {
-      font.destroy();
+      acquired.font.destroy();
     }
   }
 
@@ -97,15 +132,23 @@ export class PdfEngine {
       doc.destroy();
       throw new Error("PDF Folio could not open the PDF editing layer.");
     }
-    this.originalBytes = bytes.slice();
-    this.password = password;
-    const pageCount = pdf.countPages();
-    const pages: PageModel[] = [];
-    for (let index = 0; index < pageCount; index += 1)
-      pages.push(this.extractPage(pdf, index));
-    const title = pdf.getMetaData(mupdf.Document.META_INFO_TITLE);
-    pdf.destroy();
-    return { name, size: bytes.byteLength, pageCount, pages, title };
+    this.clearDocumentFonts();
+    try {
+      this.originalBytes = bytes.slice();
+      this.password = password;
+      const pageCount = pdf.countPages();
+      const pages: PageModel[] = [];
+      for (let index = 0; index < pageCount; index += 1)
+        pages.push(this.extractPage(pdf, index));
+      const title = pdf.getMetaData(mupdf.Document.META_INFO_TITLE);
+      return { name, size: bytes.byteLength, pageCount, pages, title };
+    } catch (error) {
+      this.clearDocumentFonts();
+      this.originalBytes = null;
+      throw error;
+    } finally {
+      pdf.destroy();
+    }
   }
 
   private extractPage(doc: PDFDocument, index: number): PageModel {
@@ -115,6 +158,7 @@ export class PdfEngine {
     const insertable =
       Math.abs(pageTransform[1]) < 0.01 && Math.abs(pageTransform[2]) < 0.01;
     const elements: Array<TextElement | ImageElement> = [];
+    const capturedGlyphs = this.capturePageFonts(page, index);
     const text = page.toStructuredText("preserve-spans,preserve-images");
     let line = { direction: [1, 0] as [number, number], index: 0 };
     let span: Omit<TextElement, "id" | "kind" | "pageIndex"> | null = null;
@@ -152,31 +196,48 @@ export class PdfEngine {
         color: Color,
         bidi: number,
       ) => {
-        charCount += 1;
-        const rect = quadToRect(quad);
-        const colorHex = colorToHex(color);
-        const key = `${line.index}:${font.getName()}:${size.toFixed(2)}:${colorHex}:${bidi}`;
-        const horizontal =
-          Math.abs(line.direction[1]) < 0.02 &&
-          Math.abs(quad[1] - quad[3]) < 0.5;
-        if (span && key === spanKey) {
-          span.text += character;
-          span.rect = unionRect(span.rect, rect);
-        } else {
-          flush();
-          spanKey = key;
-          span = {
-            rect,
-            text: character,
-            fontName: font.getName(),
-            fontSize: size,
-            baseline: origin[1],
-            color: colorHex,
-            editable: horizontal,
-            limitation: horizontal
-              ? undefined
-              : "Rotated or vertical text is view-only to avoid damaging its layout.",
-          };
+        try {
+          charCount += 1;
+          const rect = quadToRect(quad);
+          const colorHex = colorToHex(color);
+          const record = findCapturedFont(capturedGlyphs, character, origin);
+          const baseFontId = suggestedFontId(font.getName());
+          const fontId = record?.definition.id ?? baseFontId;
+          const exact = Boolean(record || baseFontId);
+          const key = `${line.index}:${fontId ?? font.getName()}:${size.toFixed(2)}:${colorHex}:${bidi}`;
+          const horizontal =
+            Math.abs(line.direction[1]) < 0.02 &&
+            Math.abs(quad[1] - quad[3]) < 0.5;
+          if (span && key === spanKey) {
+            span.text += character;
+            span.rect = unionRect(span.rect, rect);
+          } else {
+            flush();
+            spanKey = key;
+            span = {
+              rect,
+              text: character,
+              fontName: font.getName(),
+              fontId,
+              fontExactAvailable: exact,
+              fontAvailabilityReason: record
+                ? record.definition.subset
+                  ? "Exact embedded original font (subset)"
+                  : "Exact embedded original font"
+                : baseFontId
+                  ? "Exact PDF base font"
+                  : "The original font cannot be safely reused from this PDF. Upload the matching TTF/OTF or explicitly choose a replacement font.",
+              fontSize: size,
+              baseline: origin[1],
+              color: colorHex,
+              editable: horizontal,
+              limitation: horizontal
+                ? undefined
+                : "Rotated or vertical text is view-only to avoid damaging its layout.",
+            };
+          }
+        } finally {
+          font.destroy();
         }
       },
       endLine: flush,
@@ -266,6 +327,91 @@ export class PdfEngine {
         ? undefined
         : "Adding or replacing page content is disabled on rotated pages to preserve their coordinate system.",
     };
+  }
+
+  private capturePageFonts(page: PDFPage, pageIndex: number): CapturedGlyph[] {
+    const embeddedFonts = embeddedFontResources(page);
+    const recordsByPointer = new Map<number, DocumentFontRecord>();
+    const glyphs: CapturedGlyph[] = [];
+    const visitText = (text: Text, ctm: Matrix) => {
+      text.walk({
+        showGlyph: (font, transform, glyph, unicode) => {
+          try {
+            const name = font.getName();
+            const candidates = embeddedFonts.filter(
+              (candidate) => candidate.fontName === name,
+            );
+            if (candidates.length !== 1) return;
+            let record = recordsByPointer.get(font.pointer as number);
+            if (!record) {
+              const resource = candidates[0];
+              const subset = /^[A-Z]{6}\+/.test(name);
+              if (
+                subset &&
+                (!resource.objectNumber || !resource.characterCodes.size)
+              )
+                return;
+              const sequence = this.documentFontSequence++;
+              const key = `document-font-${sequence}`;
+              const definition: FontDefinition = {
+                id: key,
+                family: displayFontName(name),
+                category: "Document original",
+                source: subset
+                  ? "Exact embedded original font subset"
+                  : "Exact embedded original font",
+                documentFontKey: key,
+                exactOriginal: true,
+                subset,
+                coverage: subset
+                  ? "Glyphs embedded in this PDF"
+                  : "Defined by the embedded font",
+              };
+              record = {
+                key,
+                definition,
+                font: new mupdf.Font(font.pointer),
+                glyphs: new Map(),
+                ambiguousGlyphs: new Set(),
+                pdfObjectNumber: resource.objectNumber,
+                characterCodes: resource.characterCodes,
+              };
+              recordsByPointer.set(font.pointer as number, record);
+              this.documentFonts.set(key, record);
+            }
+            const existing = record.glyphs.get(unicode);
+            if (existing !== undefined && existing !== glyph)
+              record.ambiguousGlyphs.add(unicode);
+            else record.glyphs.set(unicode, glyph);
+            const point = transformPoint(ctm, transform[4], transform[5]);
+            glyphs.push({
+              x: point[0],
+              y: point[1],
+              codePoint: unicode,
+              record,
+            });
+          } finally {
+            font.destroy();
+          }
+        },
+      });
+    };
+    const device = new mupdf.Device({
+      fillText: (text, ctm) => visitText(text, ctm),
+      strokeText: (text, _stroke, ctm) => visitText(text, ctm),
+      clipText: (text, ctm) => visitText(text, ctm),
+      clipStrokeText: (text, _stroke, ctm) => visitText(text, ctm),
+      ignoreText: (text, ctm) => visitText(text, ctm),
+    });
+    try {
+      page.runPageContents(device, mupdf.Matrix.identity);
+      device.close();
+    } catch {
+      // Selection still works when an unusual content stream cannot be walked.
+    } finally {
+      device.destroy();
+    }
+    return glyphs;
   }
 
   async renderPage(
@@ -402,9 +548,10 @@ export class PdfEngine {
     operation: Extract<EditOperation, { kind: "replace-text" | "add-text" }>,
     fonts: FontDefinition[],
   ) {
-    const definition =
-      fonts.find((font) => font.id === operation.fontId) ?? fonts[0];
-    const font = await loadFont(definition);
+    const definition = fonts.find((font) => font.id === operation.fontId);
+    if (!definition) throw new Error("Choose an available font.");
+    const acquired = await this.acquireFont(definition);
+    const font = acquired.font;
     try {
       const [x0, y0, x1, y1] = operation.rect;
       const width = Math.max(1, x1 - x0);
@@ -413,6 +560,7 @@ export class PdfEngine {
         operation.text,
         width,
         operation.fontSize,
+        acquired.resolveGlyph,
       );
       const lineHeight = operation.fontSize * 1.2;
       const requiredHeight = Math.max(
@@ -420,6 +568,20 @@ export class PdfEngine {
         lines.length * lineHeight,
       );
       const height = Math.max(requiredHeight, y1 - y0);
+      if (
+        definition.subset &&
+        acquired.pdfObjectNumber &&
+        acquired.characterCodes
+      ) {
+        this.insertOriginalSubsetText(
+          page,
+          operation,
+          lines,
+          acquired.pdfObjectNumber,
+          acquired.characterCodes,
+        );
+        return;
+      }
       const displayList = new mupdf.DisplayList([0, 0, width, height]);
       const device = new mupdf.DisplayListDevice(displayList);
       const text = new mupdf.Text();
@@ -434,18 +596,27 @@ export class PdfEngine {
           Math.min(height - operation.fontSize * 0.15, originalBaseline),
         );
         lines.forEach((line, index) => {
-          text.showString(
-            font,
-            [
-              operation.fontSize,
-              0,
-              0,
-              -operation.fontSize,
-              0,
-              firstBaseline + index * lineHeight,
-            ],
-            line,
-          );
+          const baseline = firstBaseline + index * lineHeight;
+          if (definition.documentFontKey) {
+            let x = 0;
+            for (const character of Array.from(line)) {
+              const codePoint = character.codePointAt(0)!;
+              const glyph = acquired.resolveGlyph(character);
+              text.showGlyph(
+                font,
+                [operation.fontSize, 0, 0, -operation.fontSize, x, baseline],
+                glyph,
+                codePoint,
+              );
+              x += font.advanceGlyph(glyph) * operation.fontSize;
+            }
+          } else {
+            text.showString(
+              font,
+              [operation.fontSize, 0, 0, -operation.fontSize, 0, baseline],
+              line,
+            );
+          }
         });
         device.fillText(
           text,
@@ -491,6 +662,87 @@ export class PdfEngine {
     }
   }
 
+  private insertOriginalSubsetText(
+    page: PDFPage,
+    operation: Extract<EditOperation, { kind: "replace-text" | "add-text" }>,
+    lines: string[],
+    pdfObjectNumber: number,
+    characterCodes: Map<number, Uint8Array>,
+  ) {
+    const doc = page._doc;
+    const pageObject = page.getObject();
+    const inherited = pageObject.getInheritable("Resources").resolve();
+    const resources = doc.newDictionary();
+    if (inherited.isDictionary())
+      inherited.forEach((value, key) => resources.put(key, value));
+    const inheritedFontValue = inherited.get("Font");
+    const inheritedFonts = inheritedFontValue.isIndirect()
+      ? inheritedFontValue.resolve()
+      : inheritedFontValue;
+    const fonts = doc.newDictionary();
+    if (inheritedFonts.isDictionary())
+      inheritedFonts.forEach((value, key) => fonts.put(key, value));
+    let alias: string;
+    do alias = `FolioOriginal${this.documentFontSequence++}`;
+    while (!fonts.get(alias).isNull());
+    fonts.put(alias, doc.newIndirect(pdfObjectNumber));
+    resources.put("Font", fonts);
+    pageObject.put("Resources", resources);
+
+    const [x0, y0] = operation.rect;
+    const sourceY = operation.sourceRect?.[1] ?? y0;
+    const baselineOffset = operation.baseline
+      ? operation.baseline - sourceY
+      : operation.fontSize;
+    const firstBaseline = y0 + baselineOffset;
+    const lineHeight = operation.fontSize * 1.2;
+    const inverse = mupdf.Matrix.invert(page.getTransform());
+    const color = hexToColor(operation.color) as [number, number, number];
+    const commands = [
+      "Q",
+      "q",
+      `${color[0]} ${color[1]} ${color[2]} rg`,
+      "BT",
+      "0 Tc 0 Tw 100 Tz 0 Ts 0 Tr",
+    ];
+    lines.forEach((line, index) => {
+      const point = transformPoint(
+        inverse,
+        x0,
+        firstBaseline + index * lineHeight,
+      );
+      const encoded: number[] = [];
+      for (const character of Array.from(line)) {
+        const code = characterCodes.get(character.codePointAt(0)!);
+        if (!code)
+          throw new Error(
+            `The exact original font cannot safely encode “${character}”. Upload the matching TTF/OTF or explicitly choose another font.`,
+          );
+        encoded.push(...code);
+      }
+      const hex = encoded
+        .map((byte) => byte.toString(16).padStart(2, "0"))
+        .join("");
+      commands.push(
+        `/${alias} ${operation.fontSize} Tf`,
+        `1 0 0 1 ${point[0]} ${point[1]} Tm`,
+        `<${hex}> Tj`,
+      );
+    });
+    commands.push("ET", "Q");
+    const prefix = doc.addStream(new TextEncoder().encode("q\n"), {});
+    const stream = doc.addStream(new TextEncoder().encode(commands.join("\n")), {});
+    const contents = pageObject.get("Contents");
+    const array = doc.newArray();
+    array.push(prefix);
+    if (contents.isArray())
+      for (let index = 0; index < contents.length; index += 1)
+        array.push(contents.get(index));
+    else if (!contents.isNull()) array.push(contents);
+    array.push(stream);
+    pageObject.put("Contents", array);
+  }
+
   private openPdf(bytes: Uint8Array) {
     const doc = mupdf.Document.openDocument(bytes, "application/pdf");
     if (doc.needsPassword() && doc.authenticatePassword(this.password) === 0) {
@@ -505,6 +757,54 @@ export class PdfEngine {
   private requireBytes() {
     if (!this.originalBytes) throw new Error("Open a PDF first.");
     return this.originalBytes;
+  }
+
+  private async acquireFont(definition: FontDefinition) {
+    if (definition.documentFontKey) {
+      const record = this.documentFonts.get(definition.documentFontKey);
+      if (!record)
+        throw new Error(
+          "The original document font is no longer available. Reopen the PDF or choose another font.",
+        );
+      const font = new mupdf.Font(record.font.pointer);
+      const glyphs = new Map(record.glyphs);
+      const ambiguous = new Set(record.ambiguousGlyphs);
+      return {
+        font,
+        pdfObjectNumber: record.pdfObjectNumber,
+        characterCodes: record.characterCodes
+          ? new Map(record.characterCodes)
+          : undefined,
+        resolveGlyph: (character: string) => {
+          const codePoint = character.codePointAt(0)!;
+          let glyph = font.encodeCharacter(codePoint);
+          if (!glyph && !ambiguous.has(codePoint)) glyph = glyphs.get(codePoint) ?? 0;
+          if (!glyph)
+            throw new Error(
+              `The exact original font “${definition.family}” does not contain “${character}”. ${definition.subset ? "This PDF embeds only a subset of that font. " : ""}Upload the matching TTF/OTF or explicitly choose another font.`,
+            );
+          return glyph;
+        },
+      };
+    }
+    const font = await loadFont(definition);
+    return {
+      font,
+      resolveGlyph: (character: string) => {
+        const codePoint = character.codePointAt(0)!;
+        const glyph = font.encodeCharacter(codePoint);
+        if (!glyph)
+          throw new Error(
+            `The selected font does not contain “${character}”. Choose a font with the required glyphs.`,
+          );
+        return glyph;
+      },
+    };
+  }
+
+  private clearDocumentFonts() {
+    for (const record of this.documentFonts.values()) record.font.destroy();
+    this.documentFonts.clear();
   }
 }
 
@@ -550,20 +850,180 @@ function rectsOverlap(a: Rect, b: Rect) {
   return overlapWidth > 0.5 && overlapHeight > 0.5;
 }
 
+function embeddedFontResources(page: PDFPage) {
+  const result: ResourceFontInfo[] = [];
+  const visited = new Set<number>();
+  const seenFonts = new Set<string>();
+  try {
+    const scanResources = (resources: PDFObject) => {
+      resources = resolvePdfObject(resources);
+      if (!resources.isDictionary()) return;
+      const fonts = resolvePdfObject(resources.get("Font"));
+      if (fonts.isDictionary())
+        fonts.forEach((value) => {
+          const objectNumber = value.isIndirect()
+            ? value.asIndirect()
+            : undefined;
+          const font = resolvePdfObject(value);
+          const subtype = font.get("Subtype");
+          if (subtype.isName() && subtype.asName() === "Type3") return;
+          const baseFont = font.get("BaseFont");
+          let descriptor = font.get("FontDescriptor");
+          if (descriptor.isNull()) {
+            const descendants = font.get("DescendantFonts");
+            if (descendants.isArray() && descendants.length)
+              descriptor = resolvePdfObject(descendants.get(0)).get(
+                "FontDescriptor",
+              );
+          }
+          descriptor = resolvePdfObject(descriptor);
+          if (!descriptor.isDictionary() || !baseFont.isName()) return;
+          const embedded = ["FontFile", "FontFile2", "FontFile3"].some(
+            (key) => !descriptor.get(key).isNull(),
+          );
+          if (!embedded) return;
+          const fontName = baseFont.asName();
+          const identity = `${objectNumber ?? "direct"}:${fontName}`;
+          if (seenFonts.has(identity)) return;
+          seenFonts.add(identity);
+          result.push({
+            fontName,
+            objectNumber,
+            characterCodes: inverseToUnicode(font.get("ToUnicode")),
+          });
+        });
+      const xObjects = resolvePdfObject(resources.get("XObject"));
+      if (!xObjects.isDictionary()) return;
+      xObjects.forEach((value) => {
+        const number = value.isIndirect() ? value.asIndirect() : -1;
+        if (number >= 0 && visited.has(number)) return;
+        if (number >= 0) visited.add(number);
+        const object = resolvePdfObject(value);
+        const nested = object.get("Resources");
+        if (!nested.isNull()) scanResources(nested);
+      });
+    };
+    scanResources(page.getObject().getInheritable("Resources"));
+  } catch {
+    // Missing or malformed resource dictionaries simply mean no exact font offer.
+  }
+  return result;
+}
+
+function resolvePdfObject(value: PDFObject) {
+  return value.isIndirect() ? value.resolve() : value;
+}
+
+function inverseToUnicode(value: PDFObject) {
+  const result = new Map<number, Uint8Array>();
+  try {
+    if (value.isNull()) return result;
+    const buffer = value.readStream();
+    let source = "";
+    try {
+      source = buffer.asString();
+    } finally {
+      buffer.destroy();
+    }
+    const add = (sourceHex: string, unicodeHex: string) => {
+      const unicodeBytes = hexBytes(unicodeHex);
+      if (!unicodeBytes.length) return;
+      let text = "";
+      for (let index = 0; index + 1 < unicodeBytes.length; index += 2)
+        text += String.fromCharCode(
+          (unicodeBytes[index] << 8) | unicodeBytes[index + 1],
+        );
+      const points = Array.from(text);
+      if (points.length === 1)
+        result.set(points[0].codePointAt(0)!, hexBytes(sourceHex));
+    };
+    for (const block of source.matchAll(/beginbfchar([\s\S]*?)endbfchar/g))
+      for (const match of block[1].matchAll(
+        /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g,
+      ))
+        add(match[1], match[2]);
+    for (const block of source.matchAll(/beginbfrange([\s\S]*?)endbfrange/g))
+      for (const match of block[1].matchAll(
+        /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g,
+      )) {
+        const start = Number.parseInt(match[1], 16);
+        const end = Number.parseInt(match[2], 16);
+        const unicodeStart = Number.parseInt(match[3], 16);
+        if (
+          !Number.isSafeInteger(start) ||
+          !Number.isSafeInteger(end) ||
+          !Number.isSafeInteger(unicodeStart) ||
+          start < 0 ||
+          end < start ||
+          end > 0xffffffff ||
+          end - start > 65535 ||
+          unicodeStart < 0 ||
+          unicodeStart + end - start > 0x10ffff
+        )
+          continue;
+        const width = match[1].length / 2;
+        for (let code = start; code <= end; code += 1) {
+          const sourceHex = code.toString(16).padStart(width * 2, "0");
+          const unicodeHex = (unicodeStart + code - start)
+            .toString(16)
+            .padStart(4, "0");
+          add(sourceHex, unicodeHex);
+        }
+      }
+  } catch {
+    return new Map<number, Uint8Array>();
+  }
+  return result;
+}
+
+function hexBytes(hex: string) {
+  const bytes = new Uint8Array(Math.floor(hex.length / 2));
+  for (let index = 0; index < bytes.length; index += 1)
+    bytes[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  return bytes;
+}
+
+function displayFontName(name: string) {
+  return name.replace(/^[A-Z]{6}\+/, "").replace(/[-_]/g, " ");
+}
+
+function transformPoint(matrix: Matrix, x: number, y: number): [number, number] {
+  return [
+    matrix[0] * x + matrix[2] * y + matrix[4],
+    matrix[1] * x + matrix[3] * y + matrix[5],
+  ];
+}
+
+function findCapturedFont(
+  glyphs: CapturedGlyph[],
+  character: string,
+  origin: [number, number],
+) {
+  const codePoint = character.codePointAt(0)!;
+  let best: CapturedGlyph | undefined;
+  let distance = Number.POSITIVE_INFINITY;
+  for (const glyph of glyphs) {
+    if (glyph.codePoint !== codePoint) continue;
+    const next = Math.abs(glyph.x - origin[0]) + Math.abs(glyph.y - origin[1]);
+    if (next < distance) {
+      best = glyph;
+      distance = next;
+    }
+  }
+  return distance < 2 ? best?.record : undefined;
+}
+
 function layoutLines(
   font: Font,
   text: string,
   maxWidth: number,
   fontSize: number,
+  resolveGlyph: (character: string) => number,
 ) {
   const result: string[] = [];
   const measure = (value: string) =>
     Array.from(value).reduce((width, character) => {
-      const glyph = font.encodeCharacter(character);
-      if (glyph === 0 && !/\s/.test(character))
-        throw new Error(
-          `The selected font does not contain “${character}”. Choose a font with the required glyphs.`,
-        );
+      const glyph = resolveGlyph(character);
       return width + font.advanceGlyph(glyph) * fontSize;
     }, 0);
   for (const character of Array.from(text)) measure(character);

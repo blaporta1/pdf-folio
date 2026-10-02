@@ -3,11 +3,14 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject, TextStringObject
+from fontTools.ttLib import TTFont
+from pypdf.generic import ArrayObject, DecodedStreamObject, DictionaryObject, FloatObject, NameObject, NumberObject, TextStringObject
 from reportlab.lib.colors import HexColor
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont as ReportLabTTFont
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "test" / "fixtures"
@@ -84,3 +87,107 @@ output = FIXTURES / "engine-fixture.pdf"
 with output.open("wb") as stream:
     writer.write(stream)
 print(output)
+
+
+def make_full_font_pdf() -> None:
+    font_path = ROOT / "public" / "fonts" / "Inter.ttf"
+    font_bytes = font_path.read_bytes()
+    tt = TTFont(font_path)
+    cmap = tt.getBestCmap()
+    units = tt["head"].unitsPerEm
+    widths = []
+    for code in range(32, 127):
+        glyph = cmap.get(code, ".notdef")
+        advance = tt["hmtx"].metrics[glyph][0]
+        widths.append(NumberObject(round(advance * 1000 / units)))
+
+    full = PdfWriter()
+    page = full.add_blank_page(width=612, height=792)
+    font_file = DecodedStreamObject()
+    font_file.set_data(font_bytes)
+    font_file[NameObject("/Length1")] = NumberObject(len(font_bytes))
+    font_file_ref = full._add_object(font_file)
+    head = tt["head"]
+    hhea = tt["hhea"]
+    descriptor = DictionaryObject({
+        NameObject("/Type"): NameObject("/FontDescriptor"),
+        NameObject("/FontName"): NameObject("/Inter-Regular"),
+        NameObject("/Flags"): NumberObject(32),
+        NameObject("/FontBBox"): ArrayObject([NumberObject(round(value * 1000 / units)) for value in (head.xMin, head.yMin, head.xMax, head.yMax)]),
+        NameObject("/ItalicAngle"): NumberObject(0),
+        NameObject("/Ascent"): NumberObject(round(hhea.ascent * 1000 / units)),
+        NameObject("/Descent"): NumberObject(round(hhea.descent * 1000 / units)),
+        NameObject("/CapHeight"): NumberObject(round(hhea.ascent * 1000 / units)),
+        NameObject("/StemV"): NumberObject(90),
+        NameObject("/FontFile2"): font_file_ref,
+    })
+    descriptor_ref = full._add_object(descriptor)
+    cmap_lines = [
+        "/CIDInit /ProcSet findresource begin", "12 dict begin", "begincmap",
+        "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+        "/CMapName /Adobe-Identity-UCS def", "/CMapType 2 def",
+        "1 begincodespacerange", "<00> <FF>", "endcodespacerange",
+        "95 beginbfchar",
+    ]
+    cmap_lines.extend(f"<{code:02X}> <{code:04X}>" for code in range(32, 127))
+    cmap_lines.extend(["endbfchar", "endcmap", "CMapName currentdict /CMap defineresource pop", "end", "end"])
+    to_unicode = DecodedStreamObject()
+    to_unicode.set_data("\n".join(cmap_lines).encode("ascii"))
+    to_unicode_ref = full._add_object(to_unicode)
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/TrueType"),
+        NameObject("/BaseFont"): NameObject("/Inter-Regular"),
+        NameObject("/FirstChar"): NumberObject(32),
+        NameObject("/LastChar"): NumberObject(126),
+        NameObject("/Widths"): ArrayObject(widths),
+        NameObject("/Encoding"): NameObject("/WinAnsiEncoding"),
+        NameObject("/FontDescriptor"): descriptor_ref,
+        NameObject("/ToUnicode"): to_unicode_ref,
+    })
+    font_ref = full._add_object(font)
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})
+    })
+    contents = DecodedStreamObject()
+    contents.set_data(b"BT /F1 18 Tf 72 700 Td (Original text) Tj ET")
+    page[NameObject("/Contents")] = full._add_object(contents)
+    path = FIXTURES / "full-embedded-font.pdf"
+    with path.open("wb") as stream:
+        full.write(stream)
+    tt.close()
+    print(path)
+
+
+make_full_font_pdf()
+
+
+def make_subset_font_pdf() -> None:
+    pdfmetrics.registerFont(ReportLabTTFont("FixtureInter", ROOT / "public" / "fonts" / "Inter.ttf"))
+    raw = BytesIO()
+    fixture = canvas.Canvas(raw, pagesize=letter, pageCompression=1)
+    fixture.setFont("FixtureInter", 18)
+    fixture.drawString(72, 700, "Dummy PDF file")
+    fixture.save()
+    raw.seek(0)
+    reader = PdfReader(raw)
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    page = writer.pages[0]
+    state = DecodedStreamObject()
+    # Intentionally leave CTM, horizontal scaling, and invisible text mode altered.
+    # The editor must isolate original streams before appending replacement text.
+    state.set_data(b"2 0 0 2 0 0 cm BT 200 Tz 3 Tr ET")
+    state_ref = writer._add_object(state)
+    contents = page.get("/Contents")
+    if isinstance(contents, ArrayObject):
+        contents.append(state_ref)
+    else:
+        page[NameObject("/Contents")] = ArrayObject([contents, state_ref])
+    path = FIXTURES / "subset-embedded-font.pdf"
+    with path.open("wb") as stream:
+        writer.write(stream)
+    print(path)
+
+
+make_subset_font_pdf()

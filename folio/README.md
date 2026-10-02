@@ -17,7 +17,7 @@ npm run build
 npm run preview
 ```
 
-`npm test` covers text removal and extraction, unchanged layout, annotation and link preservation, repeated image instances, moved replacement text, uploaded Unicode font embedding, missing glyph rejection, and rotated/cropped page safety. `npm run build` creates the static site in `dist/`.
+`npm test` covers text removal and extraction, exact embedded-subset font reuse, missing-subset-glyph refusal, retained-font cleanup between imports, explicit replacement fonts, unchanged layout, annotation and link preservation, repeated image instances, moved replacement text, uploaded Unicode font embedding, and rotated/cropped page safety. `npm run build` creates the static site in `dist/`.
 
 ## What editing means
 
@@ -31,7 +31,7 @@ npm run preview
 
 - Scanned pages are detected, but PDF Folio does not perform OCR. Text inside a scan is not selectable.
 - Rotated pages and rotated, vertical, mirrored, masked, clipped, overlapping, or otherwise complex objects are view-only when editing could damage layout or the wrong layer.
-- Embedded source fonts usually cannot be reused directly. The inspector preserves an exact standard PDF base font when possible and otherwise shows the fallback before applying. The bundled font collection is curated rather than universal.
+- The inspector defaults to the exact original font when the PDF exposes a safely reusable embedded font resource or one of the 14 standard PDF base fonts. Embedded subsets accept only glyphs present in that subset; PDF Folio blocks unsupported characters and asks for a matching TTF/OTF or an explicit replacement. Type 3 fonts, malformed/unsupported CMaps, and non-embedded nonstandard fonts require an explicitly chosen replacement.
 - PDF text is drawn object by object. Complex shaping, unusual encodings, and advanced bidirectional layouts may require a suitable uploaded font and can still be unsuitable for direct editing.
 - The browser file limit is 150 MB. Large or image-heavy documents may still require substantial memory.
 - Password-protected PDFs require the correct password. Passwords and document bytes stay in browser memory.
