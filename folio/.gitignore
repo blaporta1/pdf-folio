@@ -1,0 +1,14 @@
+node_modules
+dist
+.vercel
+.env
+.env.*
+!.env.example
+coverage
+playwright-report
+test-results
+.DS_Store
+tmp
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts

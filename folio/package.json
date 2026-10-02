@@ -1,0 +1,39 @@
+{
+  "name": "pdf-folio",
+  "private": true,
+  "version": "0.1.0",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://github.com/blaporta1/pdf-folio#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/blaporta1/pdf-folio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/blaporta1/pdf-folio/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "preview": "vite preview --host 0.0.0.0 --port 5173"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "lucide-react": "latest",
+    "mupdf": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@testing-library/react": "latest",
+    "@types/node": "^26.6.4",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "jsdom": "latest",
+    "typescript": "latest",
+    "vitest": "latest"
+  }
+}

@@ -1,0 +1,49 @@
+# PDF Folio
+
+PDF Folio is a private, browser-local PDF editor built with React, TypeScript, Vite, and MuPDF.js. It detects existing text spans and image instances, renders the original PDF at high fidelity, applies targeted content redactions, embeds replacement fonts and images, and exports a rewritten PDF without sending the document to a server.
+
+## Run locally
+
+```bash
+npm install
+npm run dev
+```
+
+The development server uses `http://localhost:5173`.
+
+```bash
+npm test
+npm run build
+npm run preview
+```
+
+`npm test` covers text removal and extraction, unchanged layout, annotation and link preservation, repeated image instances, moved replacement text, uploaded Unicode font embedding, missing glyph rejection, and rotated/cropped page safety. `npm run build` creates the static site in `dist/`.
+
+## What editing means
+
+- Existing horizontal text spans are selected from MuPDF structured text. Export permanently removes the selected source content with a targeted redaction and bakes the replacement into page content.
+- Existing unmasked, unclipped, axis-aligned images can be replaced, moved, resized, or deleted. PDF Folio stores each detected instance separately so editing one repeated image does not intentionally change the others.
+- Unchanged page content remains untouched by the edit pipeline. Existing annotations, links, form widgets, and unapplied redaction annotations are detached during PDF Folio's bake step and restored before the final full rewrite.
+- Custom TTF and OTF uploads remain in the current browser session. Fonts used by an edit are embedded in the exported PDF.
+- Undo and redo store operation snapshots; the opened source bytes are never overwritten.
+
+## Honest limits
+
+- Scanned pages are detected, but PDF Folio does not perform OCR. Text inside a scan is not selectable.
+- Rotated pages and rotated, vertical, mirrored, masked, clipped, overlapping, or otherwise complex objects are view-only when editing could damage layout or the wrong layer.
+- Embedded source fonts usually cannot be reused directly. The inspector preserves an exact standard PDF base font when possible and otherwise shows the fallback before applying. The bundled font collection is curated rather than universal.
+- PDF text is drawn object by object. Complex shaping, unusual encodings, and advanced bidirectional layouts may require a suitable uploaded font and can still be unsuitable for direct editing.
+- The browser file limit is 150 MB. Large or image-heavy documents may still require substantial memory.
+- Password-protected PDFs require the correct password. Passwords and document bytes stay in browser memory.
+
+## Licensing
+
+PDF Folio is distributed under the GNU Affero General Public License v3 or later. The complete license is in [LICENSE](./LICENSE), and the corresponding application source is published at [github.com/blaporta1/pdf-folio](https://github.com/blaporta1/pdf-folio). The repository includes the lockfile and build instructions needed to reproduce the application bundle.
+
+MuPDF.js and MuPDF are copyright Artifex Software and are also available under the GNU Affero General Public License v3 or later. PDF Folio currently locks MuPDF.js 1.28.1. Artifex offers commercial licensing for deployments that do not comply with the AGPL. See [MuPDF licensing](https://www.mupdf.com/licensing/index.html), the [MuPDF.js source repository](https://github.com/ArtifexSoftware/mupdf.js), and the [MuPDF source repository](https://cgit.ghostscript.com/mupdf.git/).
+
+The 18 bundled font families are sourced from Google Fonts and distributed under the SIL Open Font License 1.1. See [FONT-LICENSES.md](./FONT-LICENSES.md) and `public/fonts/OFL-1.1.txt`.
+
+## Deployment
+
+PDF Folio is a static Vite application. `vercel.json` configures Vercel to run the production build and serve `dist/`. No server-side document handling is required.
