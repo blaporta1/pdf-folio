@@ -69,6 +69,19 @@ export class PdfEngine {
     this.customFonts = [...this.customFonts, font];
   }
 
+  addFonts(fonts: FontDefinition[]) {
+    const existing = new Set(this.customFonts.map((font) => font.id));
+    const added: FontDefinition[] = [];
+    for (const font of fonts) {
+      const key = font.id;
+      if (existing.has(key)) continue;
+      existing.add(key);
+      added.push(font);
+    }
+    this.customFonts = [...this.customFonts, ...added];
+    return added.length;
+  }
+
   getFonts() {
     return [
       ...Array.from(this.documentFonts.values(), (record) => record.definition),

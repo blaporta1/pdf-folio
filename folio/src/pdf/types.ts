@@ -87,6 +87,9 @@ export interface FontDefinition {
   file?: string;
   base14?: string;
   bytes?: Uint8Array;
+  browserFile?: File;
+  postscriptName?: string;
+  styleName?: string;
   uploaded?: boolean;
   documentFontKey?: string;
   exactOriginal?: boolean;

@@ -3,7 +3,12 @@ import { resolve } from "node:path";
 import mupdf, { type PDFPage } from "mupdf";
 import { describe, expect, it } from "vitest";
 import { PdfEngine } from "./engine";
-import { bundledFonts, validateAndCreateUploadedFont } from "./fonts";
+import {
+  bundledFonts,
+  indexUploadedFontFile,
+  matchingUploadedFontId,
+  validateAndCreateUploadedFont,
+} from "./fonts";
 import type {
   ImageElement,
   ImageOperation,
@@ -122,6 +127,55 @@ function sampleRgb(bytes: Uint8Array, rect: [number, number, number, number]) {
 }
 
 describe("PdfEngine export regressions", () => {
+  it("indexes local fonts lazily and refuses ambiguous PostScript-name matches", async () => {
+    const bytes = bytesAt(resolve("public/fonts/Inter.ttf"));
+    const firstFile = new File([bytes], "Inter.ttf", { lastModified: 1 });
+    const secondFile = new File([bytes], "Inter-copy.ttf", { lastModified: 2 });
+    Object.defineProperty(firstFile, "webkitRelativePath", {
+      value: "A/Inter.ttf",
+    });
+    Object.defineProperty(secondFile, "webkitRelativePath", {
+      value: "B/Inter-copy.ttf",
+    });
+    const first = await indexUploadedFontFile(firstFile);
+    const second = await indexUploadedFontFile(secondFile);
+    expect(first.bytes).toBeUndefined();
+    expect(first.browserFile).toBe(firstFile);
+    expect(first.postscriptName).toBeTruthy();
+    expect(first.id).not.toBe(second.id);
+    expect(matchingUploadedFontId(first.postscriptName!, [first])).toBe(first.id);
+    expect(
+      matchingUploadedFontId(first.postscriptName!, [first, second]),
+    ).toBeUndefined();
+    const engine = new PdfEngine();
+    expect(engine.addFonts([first, second])).toBe(2);
+    await expect(
+      engine.validateText(first.id, "Browser local font", 240, 14),
+    ).resolves.toBeTruthy();
+  });
+
+  it("rejects local fonts whose OS/2 metadata forbids PDF embedding", async () => {
+    const bytes = bytesAt(resolve("public/fonts/Inter.ttf")).slice();
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const count = view.getUint16(4);
+    let os2Offset = -1;
+    for (let index = 0; index < count; index += 1) {
+      const offset = 12 + index * 16;
+      const tag = String.fromCharCode(
+        view.getUint8(offset),
+        view.getUint8(offset + 1),
+        view.getUint8(offset + 2),
+        view.getUint8(offset + 3),
+      );
+      if (tag === "OS/2") os2Offset = view.getUint32(offset + 8);
+    }
+    expect(os2Offset).toBeGreaterThan(0);
+    view.setUint16(os2Offset + 8, 0x0002);
+    await expect(
+      indexUploadedFontFile(new File([bytes], "restricted.ttf")),
+    ).rejects.toThrow(/Restricted embedding/);
+  });
+
   it("loads every bundled open-source font file", () => {
     expect(bundledFonts).toHaveLength(18);
     for (const definition of bundledFonts) {

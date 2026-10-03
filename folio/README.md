@@ -2,6 +2,8 @@
 
 PDF Folio is a private, browser-local PDF editor built with React, TypeScript, Vite, and MuPDF.js. It detects existing text spans and image instances, renders the original PDF at high fidelity, applies targeted content redactions, embeds replacement fonts and images, and exports a rewritten PDF without sending the document to a server.
 
+Large personal font libraries can be added with **Import font folder**. Extract RAR or ZIP archives first, then choose the extracted folder in the browser. PDF Folio reads bounded OpenType metadata slices, keeps browser `File` references rather than loading every font into memory, and loads a font’s bytes only when that face is selected. The library lasts for the current browser session and is never uploaded.
+
 ## Run locally
 
 ```bash
@@ -32,6 +34,8 @@ npm run preview
 - Scanned pages are detected, but PDF Folio does not perform OCR. Text inside a scan is not selectable.
 - Rotated pages and rotated, vertical, mirrored, masked, clipped, overlapping, or otherwise complex objects are view-only when editing could damage layout or the wrong layer.
 - The inspector defaults to the exact original font when the PDF exposes a safely reusable embedded font resource or one of the 14 standard PDF base fonts. Embedded subsets accept only glyphs present in that subset; PDF Folio blocks unsupported characters and asks for a matching TTF/OTF or an explicit replacement. Type 3 fonts, malformed/unsupported CMaps, and non-embedded nonstandard fonts require an explicitly chosen replacement.
+- Local fonts are matched to PDF text only when one imported file has the same internal PostScript name. Multiple files with that name remain available for explicit selection but are not chosen automatically. OS/2 restricted, bitmap-only, and no-subsetting flags are rejected because the export engine cannot honor those embedding constraints safely.
+- Importing a local font does not grant redistribution or embedding rights. PDF Folio does not ship the user’s private font collection; users remain responsible for the licenses of fonts they select for an export.
 - PDF text is drawn object by object. Complex shaping, unusual encodings, and advanced bidirectional layouts may require a suitable uploaded font and can still be unsuitable for direct editing.
 - The browser file limit is 150 MB. Large or image-heavy documents may still require substantial memory.
 - Password-protected PDFs require the correct password. Passwords and document bytes stay in browser memory.

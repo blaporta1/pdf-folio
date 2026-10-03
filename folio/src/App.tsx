@@ -10,6 +10,7 @@ import {
   ImagePlus,
   Info,
   LockKeyhole,
+  FolderOpen,
   Minus,
   Plus,
   Redo2,
@@ -24,8 +25,10 @@ import {
 import { PdfEngine, PasswordRequiredError } from "./pdf/engine";
 import {
   canPreserveOriginal,
+  indexUploadedFontFile,
+  matchingUploadedFontId,
   suggestedFontId,
-  validateAndCreateUploadedFont,
+  uploadedFontMatchesOriginal,
 } from "./pdf/fonts";
 import type {
   DocumentModel,
@@ -41,6 +44,15 @@ import type {
 } from "./pdf/types";
 
 type BusyState = "" | "Opening PDF…" | "Rendering…" | "Exporting…";
+type FontImportState = {
+  active: boolean;
+  done: number;
+  total: number;
+  invalid: number;
+  restricted: number;
+  duplicates: number;
+  ambiguousFaces: number;
+};
 
 function App() {
   const engine = useMemo(() => new PdfEngine(), []);
@@ -63,9 +75,12 @@ function App() {
   const pendingFile = useRef<{ bytes: Uint8Array; name: string } | null>(null);
   const [licenseOpen, setLicenseOpen] = useState(false);
   const [fontVersion, setFontVersion] = useState(0);
+  const [fontImport, setFontImport] = useState<FontImportState | null>(null);
+  const fontImportRun = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const imageInput = useRef<HTMLInputElement>(null);
   const fontInput = useRef<HTMLInputElement>(null);
+  const fontFolderInput = useRef<HTMLInputElement>(null);
   const replaceImageInput = useRef<HTMLInputElement>(null);
   const stageRef = useRef<HTMLElement>(null);
   const fittedPage = useRef("");
@@ -332,31 +347,97 @@ function App() {
       return;
     }
     try {
-      const definition = validateAndCreateUploadedFont(
-        file.name,
-        new Uint8Array(await file.arrayBuffer()),
-      );
-      engine.addFont(definition);
-      if (definition.bytes && "FontFace" in window) {
-        const url = URL.createObjectURL(
-          new Blob([definition.bytes.slice().buffer as ArrayBuffer]),
-        );
-        void new FontFace(definition.family, `url(${url})`)
-          .load()
-          .then((face) => {
-            document.fonts.add(face);
-            URL.revokeObjectURL(url);
-          });
-      }
+      const definition = await indexUploadedFontFile(file);
+      engine.addFonts([definition]);
       setFontVersion((version) => version + 1);
       setNotice(
         `${definition.family} is available for this browser session and will be embedded when used.`,
       );
-    } catch {
+    } catch (reason) {
+      const message = messageOf(reason);
       setError(
-        "That font could not be read. Choose a valid, unencrypted TTF or OTF file.",
+        /restricted embedding/i.test(message)
+          ? message
+          : "That font could not be read. Choose a valid, unencrypted TTF or OTF file.",
       );
     }
+  };
+
+  const importFontFolder = async (files: File[]) => {
+    const candidates = files.filter((file) => /\.(ttf|otf)$/i.test(file.name));
+    if (!candidates.length) {
+      setError(
+        "No TTF or OTF files were found. Extract RAR or ZIP archives first, then choose the extracted font folder.",
+      );
+      return;
+    }
+    const run = ++fontImportRun.current;
+    const indexed: FontDefinition[] = [];
+    let invalid = 0;
+    let restricted = 0;
+    setError("");
+    setFontImport({
+      active: true,
+      done: 0,
+      total: candidates.length,
+      invalid: 0,
+      restricted: 0,
+      duplicates: 0,
+      ambiguousFaces: 0,
+    });
+    for (let index = 0; index < candidates.length; index += 1) {
+      if (fontImportRun.current !== run) break;
+      try {
+        indexed.push(await indexUploadedFontFile(candidates[index]));
+      } catch (reason) {
+        if (/restricted embedding/i.test(messageOf(reason))) restricted += 1;
+        else invalid += 1;
+      }
+      if ((index + 1) % 20 === 0 || index + 1 === candidates.length) {
+        setFontImport({
+          active: true,
+          done: index + 1,
+          total: candidates.length,
+          invalid,
+          restricted,
+          duplicates: 0,
+          ambiguousFaces: 0,
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    if (fontImportRun.current !== run) {
+      return;
+    }
+    const added = engine.addFonts(indexed);
+    const duplicates = indexed.length - added;
+    const faceCounts = new Map<string, number>();
+    for (const font of indexed) {
+      if (!font.postscriptName) continue;
+      const key = font.postscriptName.toLowerCase();
+      faceCounts.set(key, (faceCounts.get(key) ?? 0) + 1);
+    }
+    const ambiguousFaces = Array.from(faceCounts.values()).filter(
+      (count) => count > 1,
+    ).length;
+    setFontVersion((version) => version + 1);
+    setFontImport({
+      active: false,
+      done: candidates.length,
+      total: candidates.length,
+      invalid,
+      restricted,
+      duplicates,
+      ambiguousFaces,
+    });
+    setNotice(
+      `Local font library ready: ${added.toLocaleString()} face${added === 1 ? "" : "s"} added, ${duplicates.toLocaleString()} already imported file${duplicates === 1 ? "" : "s"}, ${ambiguousFaces.toLocaleString()} ambiguous face name${ambiguousFaces === 1 ? "" : "s"}, ${invalid.toLocaleString()} invalid, ${restricted.toLocaleString()} restricted. Font files remain on this device and load only when used.`,
+    );
+  };
+
+  const cancelFontImport = () => {
+    fontImportRun.current += 1;
+    setFontImport(null);
   };
 
   if (!documentModel) {
@@ -394,8 +475,23 @@ function App() {
               >
                 <Upload size={18} /> Open a PDF
               </button>
+              {fontImport?.active && (
+                <button className="secondary large" onClick={cancelFontImport}>
+                  Cancel indexing
+                </button>
+              )}
               <button className="secondary large" onClick={openSample}>
                 <FilePlus2 size={18} /> Try the sample
+              </button>
+              <button
+                className="secondary large"
+                onClick={() => fontFolderInput.current?.click()}
+                disabled={fontImport?.active}
+              >
+                <FolderOpen size={18} />
+                {fontImport?.active
+                  ? `Indexing ${fontImport.done.toLocaleString()} / ${fontImport.total.toLocaleString()}`
+                  : "Import font folder"}
               </button>
             </div>
             <div className="trust-row">
@@ -406,6 +502,13 @@ function App() {
               <span>Real content redaction</span>
             </div>
             {error && <Alert message={error} onClose={() => setError("")} />}
+            {notice && (
+              <Alert
+                message={notice}
+                kind="notice"
+                onClose={() => setNotice("")}
+              />
+            )}
           </section>
           <section className="feature-strip">
             <div>
@@ -454,6 +557,10 @@ function App() {
             event.target.files?.[0] && openFile(event.target.files[0])
           }
         />
+        <FontFolderInput
+          inputRef={fontFolderInput}
+          onFiles={importFontFolder}
+        />
       </div>
     );
   }
@@ -483,12 +590,22 @@ function App() {
           >
             <Type size={16} /> Add text
           </button>
+          {fontImport?.active && (
+            <button onClick={cancelFontImport}>Cancel indexing</button>
+          )}
           <button
             onClick={() => imageInput.current?.click()}
             disabled={!currentPage?.insertable}
             title={currentPage?.insertionLimitation}
           >
             <ImagePlus size={16} /> Add image
+          </button>
+          <button
+            onClick={() => fontFolderInput.current?.click()}
+            disabled={fontImport?.active}
+          >
+            <FolderOpen size={16} />
+            {fontImport?.active ? "Indexing fonts…" : "Import font folder"}
           </button>
         </div>
         <div className="tool-hint">
@@ -605,6 +722,9 @@ function App() {
                 commit={commit}
                 onSelect={setSelectedId}
                 onUploadFont={() => fontInput.current?.click()}
+                onImportFontFolder={() => fontFolderInput.current?.click()}
+                onCancelFontImport={cancelFontImport}
+                fontImport={fontImport}
                 validateText={(fontId, text, width, size) =>
                   engine.validateText(fontId, text, width, size)
                 }
@@ -698,6 +818,10 @@ function App() {
         onChange={(event) =>
           event.target.files?.[0] && addCustomFont(event.target.files[0])
         }
+      />
+      <FontFolderInput
+        inputRef={fontFolderInput}
+        onFiles={importFontFolder}
       />
       <input
         ref={replaceImageInput}
@@ -886,6 +1010,9 @@ function TextInspector({
   commit,
   onSelect,
   onUploadFont,
+  onImportFontFolder,
+  onCancelFontImport,
+  fontImport,
   validateText,
 }: {
   selected: TextElement | TextOperation;
@@ -894,6 +1021,9 @@ function TextInspector({
   commit: (items: EditOperation[]) => void;
   onSelect: (id: string) => void;
   onUploadFont: () => void;
+  onImportFontFolder: () => void;
+  onCancelFontImport: () => void;
+  fontImport: FontImportState | null;
   validateText: (
     fontId: string,
     text: string,
@@ -915,6 +1045,7 @@ function TextInspector({
     existing?.fontId ??
     (original?.fontId ??
       (original ? suggestedFontId(original.fontName) : "inter") ??
+      (original ? matchingUploadedFontId(original.fontName, fonts) : undefined) ??
       "");
   const [fontId, setFontId] = useState(initialFont);
   const [fontSize, setFontSize] = useState(
@@ -929,11 +1060,16 @@ function TextInspector({
   const [validationError, setValidationError] = useState("");
   const [validating, setValidating] = useState(false);
   const chosen = fonts.find((font) => font.id === fontId);
+  const matchingUploadId = original
+    ? matchingUploadedFontId(original.fontName, fonts)
+    : undefined;
+  const matchingUpload = fonts.find((font) => font.id === matchingUploadId);
   const preserve = original
     ? Boolean(
         chosen &&
-          (chosen.id === original.fontId ||
-        canPreserveOriginal(original.fontName, fontId))
+      (chosen.id === original.fontId ||
+        canPreserveOriginal(original.fontName, fontId) ||
+        uploadedFontMatchesOriginal(original.fontName, chosen))
       )
     : false;
   if (original && !original.editable)
@@ -1037,9 +1173,38 @@ function TextInspector({
         <span>Font</span>
         <FontPicker fonts={fonts} value={fontId} onChange={setFontId} />
       </label>
-      <button className="upload-font" onClick={onUploadFont}>
-        <Plus size={15} /> Upload TTF / OTF
-      </button>
+      <div className="font-import-actions">
+        <button
+          className="upload-font"
+          onClick={onUploadFont}
+          disabled={fontImport?.active}
+        >
+          <Plus size={15} /> Add TTF / OTF
+        </button>
+        <button
+          className="upload-font"
+          onClick={onImportFontFolder}
+          disabled={fontImport?.active}
+        >
+          <FolderOpen size={15} /> Import font folder
+        </button>
+      </div>
+      {fontImport && (
+        <div className="font-import-progress" role="status">
+          <span>
+            {fontImport.active ? "Indexing" : "Indexed"}{" "}
+            {fontImport.done.toLocaleString()} / {fontImport.total.toLocaleString()}
+          </span>
+          {fontImport.active && (
+            <button
+              type="button"
+              onClick={onCancelFontImport}
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      )}
       {original && (
         <div className={`font-status ${preserve ? "preserved" : ""}`}>
           {preserve ? <Check size={14} /> : <AlertCircle size={14} />}
@@ -1047,6 +1212,8 @@ function TextInspector({
             {preserve
               ? chosen?.documentFontKey
                 ? `${original.fontAvailabilityReason}. New text is checked against the exact embedded glyphs before applying.`
+                : uploadedFontMatchesOriginal(original.fontName, chosen)
+                  ? `Using uploaded face ${chosen?.postscriptName}, matched by its internal PostScript name. It will be embedded only in your exported PDF.`
                 : `Using the exact PDF base font for ${original.fontName}.`
               : chosen
                 ? `Using ${chosen.family} as an explicit replacement for ${original.fontName}.`
@@ -1054,6 +1221,20 @@ function TextInspector({
           </span>
         </div>
       )}
+      {original &&
+        matchingUpload &&
+        matchingUpload.id !== fontId &&
+        chosen?.documentFontKey && (
+          <div className="font-match-option">
+            <span>
+              A local full-font candidate matches this subset’s PostScript name.
+              Use it if your replacement needs more glyphs.
+            </span>
+            <button type="button" onClick={() => setFontId(matchingUpload.id)}>
+              Use {matchingUpload.family}
+            </button>
+          </div>
+        )}
       <div className="field-grid">
         <label className="field">
           <span>Size</span>
@@ -1248,11 +1429,34 @@ function FontPicker({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const selected = fonts.find((font) => font.id === value);
-  const matches = fonts.filter((font) =>
-    `${font.family} ${font.category} ${font.coverage}`
+  const [previewFontId, setPreviewFontId] = useState("");
+  useEffect(() => {
+    if (!selected?.browserFile || !("FontFace" in window)) return;
+    let cancelled = false;
+    let loadedFace: FontFace | null = null;
+    const url = URL.createObjectURL(selected.browserFile);
+    const face = new FontFace(localPreviewFamily(selected), `url(${url})`);
+    void face
+      .load()
+      .then((loaded) => {
+        if (cancelled) return;
+        document.fonts.add(loaded);
+        loadedFace = loaded;
+        setPreviewFontId(selected.id);
+      })
+      .catch(() => undefined)
+      .finally(() => URL.revokeObjectURL(url));
+    return () => {
+      cancelled = true;
+      if (loadedFace) document.fonts.delete(loadedFace);
+    };
+  }, [selected?.id]);
+  const allMatches = fonts.filter((font) =>
+    `${font.family} ${font.postscriptName ?? ""} ${font.styleName ?? ""} ${font.category} ${font.coverage}`
       .toLowerCase()
       .includes(query.toLowerCase()),
   );
+  const matches = allMatches.slice(0, 150);
   return (
     <div className="font-picker">
       <button
@@ -1263,7 +1467,12 @@ function FontPicker({
       >
         <span
           style={{
-            fontFamily: selected?.documentFontKey ? undefined : selected?.family,
+            fontFamily:
+              selected?.browserFile && previewFontId === selected.id
+                ? localPreviewFamily(selected)
+                : selected?.documentFontKey || selected?.browserFile
+                ? undefined
+                : selected?.family,
           }}
         >
           {selected?.family ?? "Choose or upload a font…"}
@@ -1282,6 +1491,12 @@ function FontPicker({
             />
           </div>
           <div className="font-results">
+            {allMatches.length > matches.length && (
+              <p className="font-result-count">
+                Showing 150 of {allMatches.length.toLocaleString()} matches. Refine
+                your search.
+              </p>
+            )}
             {matches.map((font) => (
               <button
                 type="button"
@@ -1295,7 +1510,10 @@ function FontPicker({
               >
                 <span
                   style={{
-                    fontFamily: font.documentFontKey ? undefined : font.family,
+                    fontFamily:
+                      font.documentFontKey || font.browserFile
+                        ? undefined
+                        : font.family,
                   }}
                 >
                   {font.family}
@@ -1303,6 +1521,8 @@ function FontPicker({
                 <small>
                   {font.documentFontKey
                     ? `Original PDF only · ${font.coverage}`
+                    : font.browserFile
+                      ? `${font.postscriptName} · Local file, loads when used`
                     : `${font.category} · ${font.coverage}`}
                 </small>
               </button>
@@ -1312,6 +1532,36 @@ function FontPicker({
         </div>
       )}
     </div>
+  );
+}
+
+function localPreviewFamily(font: FontDefinition) {
+  return `PDF Folio Local ${font.id}`;
+}
+
+function FontFolderInput({
+  inputRef,
+  onFiles,
+}: {
+  inputRef: { current: HTMLInputElement | null };
+  onFiles: (files: File[]) => void | Promise<void>;
+}) {
+  return (
+    <input
+      ref={(node) => {
+        inputRef.current = node;
+        node?.setAttribute("webkitdirectory", "");
+      }}
+      type="file"
+      accept=".ttf,.otf,font/ttf,font/otf"
+      multiple
+      hidden
+      onChange={(event) => {
+        const files = Array.from(event.target.files ?? []);
+        event.target.value = "";
+        if (files.length) void onFiles(files);
+      }}
+    />
   );
 }
 
@@ -1508,8 +1758,11 @@ function AboutDialog({ onClose }: { onClose: () => void }) {
         <h3>Bundled fonts</h3>
         <p>
           PDF Folio includes 18 curated open-source families under the SIL Open
-          Font License 1.1, plus the standard PDF base fonts. Upload a TTF or
-          OTF for another typeface or script.
+          Font License 1.1, plus the standard PDF base fonts. Add individual
+          TTF/OTF files or import an extracted font folder for another typeface
+          or script. Local fonts stay in this browser session, load only when
+          selected, and are not part of PDF Folio’s source distribution. You
+          are responsible for their embedding and usage rights.
         </p>
         <a href="/fonts/OFL-1.1.txt" target="_blank" rel="noreferrer">
           Read the SIL Open Font License ↗
