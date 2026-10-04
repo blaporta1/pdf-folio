@@ -12,6 +12,9 @@ export interface TextElement {
   fontAvailabilityReason?: string;
   fontSize: number;
   baseline: number;
+  horizontalScale: number;
+  characterSpacing: number;
+  wordSpacing: number;
   color: string;
   editable: boolean;
   limitation?: string;
@@ -61,6 +64,17 @@ export interface TextOperation extends BaseOperation {
   sourceId?: string;
   sourceRect?: Rect;
   baseline?: number;
+  horizontalScale?: number;
+  characterSpacing?: number;
+  wordSpacing?: number;
+  noWrap?: boolean;
+  sourceText?: string;
+  sourceFontId?: string;
+  sourceFontSize?: number;
+  sourceColor?: string;
+  sourceHorizontalScale?: number;
+  sourceCharacterSpacing?: number;
+  sourceWordSpacing?: number;
   text: string;
   fontId: string;
   fontName: string;

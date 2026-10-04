@@ -66,6 +66,7 @@ function App() {
   const [past, setPast] = useState<EditOperation[][]>([]);
   const [future, setFuture] = useState<EditOperation[][]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [textDraftRect, setTextDraftRect] = useState<Rect | null>(null);
   const [zoom, setZoom] = useState(0.74);
   const [busy, setBusy] = useState<BusyState>("");
   const [error, setError] = useState("");
@@ -94,6 +95,17 @@ function App() {
       null
     );
   }, [selectedId, currentPage, operations]);
+
+  useEffect(() => {
+    if (
+      selected &&
+      (selected.kind === "text" ||
+        selected.kind === "replace-text" ||
+        selected.kind === "add-text")
+    )
+      setTextDraftRect([...selected.rect]);
+    else setTextDraftRect(null);
+  }, [selectedId, selected?.id]);
 
   const commit = useCallback(
     (next: EditOperation[]) => {
@@ -682,6 +694,8 @@ function App() {
                 )}
                 selectedId={selectedId}
                 onSelect={setSelectedId}
+                draftRect={textDraftRect}
+                onDraftRectChange={setTextDraftRect}
                 rendered={rendered}
               />
             )}
@@ -717,6 +731,9 @@ function App() {
               <TextInspector
                 key={`${selectedId}-${fontVersion}`}
                 selected={selected as TextElement | TextOperation}
+                pageBounds={currentPage!.bounds}
+                draftRect={textDraftRect ?? selected.rect}
+                onDraftRectChange={setTextDraftRect}
                 operations={operations}
                 fonts={engine.getFonts()}
                 commit={commit}
@@ -725,8 +742,8 @@ function App() {
                 onImportFontFolder={() => fontFolderInput.current?.click()}
                 onCancelFontImport={cancelFontImport}
                 fontImport={fontImport}
-                validateText={(fontId, text, width, size) =>
-                  engine.validateText(fontId, text, width, size)
+                validateText={(fontId, text, width, size, format) =>
+                  engine.validateText(fontId, text, width, size, format)
                 }
               />
             )}
@@ -950,12 +967,16 @@ function SelectionLayer({
   operations,
   selectedId,
   onSelect,
+  draftRect,
+  onDraftRectChange,
   rendered,
 }: {
   page: NonNullable<DocumentModel["pages"][number]>;
   operations: EditOperation[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  draftRect: Rect | null;
+  onDraftRectChange: (rect: Rect) => void;
   rendered: RenderedPage;
 }) {
   void rendered;
@@ -971,7 +992,8 @@ function SelectionLayer({
   return (
     <div className="selection-layer">
       {items.map((item) => {
-        const [x0, y0, x1, y1] = item.rect;
+        const itemRect = selectedId === item.id && draftRect ? draftRect : item.rect;
+        const [x0, y0, x1, y1] = itemRect;
         const isText =
           item.kind === "text" ||
           item.kind === "replace-text" ||
@@ -996,6 +1018,88 @@ function SelectionLayer({
             }
           >
             <span>{isText ? "Text" : "Image"}</span>
+            {isText && selectedId === item.id && !disabled && (
+              <i
+                className="text-resize-handle"
+                aria-label="Resize text box"
+                onPointerDown={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const handle = event.currentTarget;
+                  const pointerId = event.pointerId;
+                  handle.setPointerCapture(pointerId);
+                  const layer = event.currentTarget.closest(
+                    ".selection-layer",
+                  ) as HTMLElement | null;
+                  if (!layer) return;
+                  const startX = event.clientX;
+                  const startY = event.clientY;
+                  let dragged = false;
+                  const startRect = [...itemRect] as Rect;
+                  const scaleX = pageWidth / layer.clientWidth;
+                  const scaleY = pageHeight / layer.clientHeight;
+                  const move = (moveEvent: PointerEvent) => {
+                    if (
+                      Math.abs(moveEvent.clientX - startX) > 2 ||
+                      Math.abs(moveEvent.clientY - startY) > 2
+                    )
+                      dragged = true;
+                    onDraftRectChange([
+                      startRect[0],
+                      startRect[1],
+                      Math.min(
+                        page.bounds[2],
+                        Math.max(
+                          startRect[0] + 8,
+                          startRect[2] + (moveEvent.clientX - startX) * scaleX,
+                        ),
+                      ),
+                      Math.min(
+                        page.bounds[3],
+                        Math.max(
+                          startRect[1] + 8,
+                          startRect[3] + (moveEvent.clientY - startY) * scaleY,
+                        ),
+                      ),
+                    ]);
+                  };
+                  const stop = () => {
+                    window.removeEventListener("pointermove", move);
+                    window.removeEventListener("pointerup", stop);
+                    window.removeEventListener("pointercancel", stop);
+                    if (handle.hasPointerCapture(pointerId))
+                      handle.releasePointerCapture(pointerId);
+                    if (dragged) {
+                      const suppressDragClick = (clickEvent: MouseEvent) => {
+                        clickEvent.preventDefault();
+                        clickEvent.stopImmediatePropagation();
+                        window.removeEventListener(
+                          "click",
+                          suppressDragClick,
+                          true,
+                        );
+                      };
+                      window.addEventListener("click", suppressDragClick, {
+                        capture: true,
+                        once: true,
+                      });
+                      window.setTimeout(
+                        () =>
+                          window.removeEventListener(
+                            "click",
+                            suppressDragClick,
+                            true,
+                          ),
+                        350,
+                      );
+                    }
+                  };
+                  window.addEventListener("pointermove", move);
+                  window.addEventListener("pointerup", stop, { once: true });
+                  window.addEventListener("pointercancel", stop, { once: true });
+                }}
+              />
+            )}
           </button>
         );
       })}
@@ -1005,6 +1109,9 @@ function SelectionLayer({
 
 function TextInspector({
   selected,
+  pageBounds,
+  draftRect,
+  onDraftRectChange,
   operations,
   fonts,
   commit,
@@ -1016,6 +1123,9 @@ function TextInspector({
   validateText,
 }: {
   selected: TextElement | TextOperation;
+  pageBounds: Rect;
+  draftRect: Rect;
+  onDraftRectChange: (rect: Rect) => void;
   operations: EditOperation[];
   fonts: FontDefinition[];
   commit: (items: EditOperation[]) => void;
@@ -1029,7 +1139,13 @@ function TextInspector({
     text: string,
     width: number,
     size: number,
-  ) => Promise<{ requiredHeight: number }>;
+    format?: {
+      horizontalScale?: number;
+      characterSpacing?: number;
+      wordSpacing?: number;
+      noWrap?: boolean;
+    },
+  ) => Promise<{ requiredHeight: number; naturalWidth: number }>;
 }) {
   const existing =
     selected.kind === "text"
@@ -1053,9 +1169,6 @@ function TextInspector({
   );
   const [color, setColor] = useState(
     existing?.color ?? original?.color ?? "#1f2422",
-  );
-  const [draftRect, setDraftRect] = useState<Rect>(
-    existing?.rect ?? selected.rect,
   );
   const [validationError, setValidationError] = useState("");
   const [validating, setValidating] = useState(false);
@@ -1098,16 +1211,51 @@ function TextInspector({
     setValidationError("");
     try {
       const currentRect = draftRect;
+      if (
+        original &&
+        text === original.text &&
+        fontId === original.fontId &&
+        Math.abs(fontSize - original.fontSize) < 0.001 &&
+        color.toLowerCase() === original.color.toLowerCase() &&
+        rectsEqual(currentRect, original.rect)
+      ) {
+        return;
+      }
+      const format = {
+        horizontalScale:
+          existing?.horizontalScale ?? original?.horizontalScale ?? 1,
+        characterSpacing:
+          existing?.characterSpacing ?? original?.characterSpacing ?? 0,
+        wordSpacing: existing?.wordSpacing ?? original?.wordSpacing ?? 0,
+        noWrap:
+          selected.kind !== "add-text" &&
+          !(original?.text ?? existing?.sourceText ?? existing?.text ?? "").includes(
+            "\n",
+          ) &&
+          !text.includes("\n"),
+      };
       const validation = await validateText(
         fontId,
         text,
         currentRect[2] - currentRect[0],
         fontSize,
+        format,
       );
+      const availableWidth = pageBounds[2] - currentRect[0];
+      const requestedWidth = format.noWrap
+        ? Math.max(
+            currentRect[2] - currentRect[0],
+            validation.naturalWidth + 0.5,
+          )
+        : currentRect[2] - currentRect[0];
+      if (format.noWrap && requestedWidth > availableWidth + 0.01)
+        throw new Error(
+          `This line needs ${requestedWidth.toFixed(1)} pt, but only ${availableWidth.toFixed(1)} pt remain before the page edge. Move or widen the box to the left, reduce the font size, or add an explicit line break.`,
+        );
       const rect: Rect = [
         currentRect[0],
         currentRect[1],
-        currentRect[2],
+        currentRect[0] + requestedWidth,
         Math.max(currentRect[3], currentRect[1] + validation.requiredHeight),
       ];
       const operation: TextOperation = existing
@@ -1119,6 +1267,7 @@ function TextInspector({
             fontName: chosen.family,
             fontSize,
             color,
+            ...format,
           }
         : {
             id: crypto.randomUUID(),
@@ -1127,13 +1276,22 @@ function TextInspector({
             rect,
             sourceRect: selected.rect,
             baseline: original?.baseline,
+            sourceText: original?.text,
+            sourceFontId: original?.fontId,
+            sourceFontSize: original?.fontSize,
+            sourceColor: original?.color,
+            sourceHorizontalScale: original?.horizontalScale,
+            sourceCharacterSpacing: original?.characterSpacing,
+            sourceWordSpacing: original?.wordSpacing,
             sourceId: selected.id,
             text,
             fontId,
             fontName: chosen.family,
             fontSize,
             color,
+            ...format,
           };
+      onDraftRectChange(rect);
       commit(
         existing
           ? operations.map((item) =>
@@ -1268,8 +1426,7 @@ function TextInspector({
       </div>
       <RectFields
         rect={draftRect}
-        onChange={setDraftRect}
-        disabled={!existing}
+        onChange={onDraftRectChange}
       />
       {(!Number.isFinite(fontSize) || fontSize < 4 || fontSize > 144) && (
         <p className="validation-error">Enter a font size from 4 to 144 pt.</p>
@@ -1779,6 +1936,12 @@ function messageOf(reason: unknown) {
   return reason instanceof Error
     ? reason.message
     : "Something went wrong while processing this PDF.";
+}
+
+function rectsEqual(left: Rect, right: Rect) {
+  return left.every(
+    (value, index) => Math.abs(value - right[index]) < 0.001,
+  );
 }
 
 export default App;

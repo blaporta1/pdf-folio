@@ -45,7 +45,17 @@ interface CapturedGlyph {
   x: number;
   y: number;
   codePoint: number;
-  record: DocumentFontRecord;
+  record?: DocumentFontRecord;
+  advance: number;
+  horizontalScale: number;
+  safeTransform: boolean;
+}
+
+interface TextFormatMetrics {
+  horizontalScale?: number;
+  characterSpacing?: number;
+  wordSpacing?: number;
+  noWrap?: boolean;
 }
 
 export class PasswordRequiredError extends Error {
@@ -94,6 +104,7 @@ export class PdfEngine {
     text: string,
     width: number,
     fontSize: number,
+    format: TextFormatMetrics = {},
   ) {
     const definition = this.getFonts().find((font) => font.id === fontId);
     if (!definition) throw new Error("Choose an available font.");
@@ -105,9 +116,25 @@ export class PdfEngine {
         Math.max(1, width),
         fontSize,
         acquired.resolveGlyph,
+        format,
+      );
+      const naturalWidth = Math.max(
+        0,
+        ...text
+          .split("\n")
+          .map((line) =>
+            measureTextWidth(
+              acquired.font,
+              line,
+              fontSize,
+              acquired.resolveGlyph,
+              format,
+            ),
+          ),
       );
       return {
         lines,
+        naturalWidth,
         requiredHeight: Math.max(
           fontSize * 1.25,
           lines.length * fontSize * 1.2,
@@ -176,12 +203,37 @@ export class PdfEngine {
     let line = { direction: [1, 0] as [number, number], index: 0 };
     let span: Omit<TextElement, "id" | "kind" | "pageIndex"> | null = null;
     let spanKey = "";
+    let previousGlyph: CapturedGlyph | undefined;
+    let spacingSamples: number[] = [];
+    let wordSpacingSamples: number[] = [];
+    let scaleSamples: number[] = [];
+    let safeFormatting = true;
     let charCount = 0;
     let imageCount = 0;
     const flush = () => {
       if (!span || !span.text.trim()) {
         span = null;
+        previousGlyph = undefined;
+        spacingSamples = [];
+        wordSpacingSamples = [];
+        scaleSamples = [];
+        safeFormatting = true;
         return;
+      }
+      const characterSpacing = median(spacingSamples) ?? 0;
+      const wordSpacing = (median(wordSpacingSamples) ?? characterSpacing) - characterSpacing;
+      const horizontalScale = median(scaleSamples) ?? 1;
+      const spacingStable =
+        stableSamples(spacingSamples, Math.max(0.2, span.fontSize * 0.025)) &&
+        stableSamples(wordSpacingSamples, Math.max(0.2, span.fontSize * 0.025)) &&
+        stableSamples(scaleSamples, 0.015);
+      span.horizontalScale = horizontalScale;
+      span.characterSpacing = characterSpacing;
+      span.wordSpacing = wordSpacing;
+      if (span.editable && (!safeFormatting || !spacingStable)) {
+        span.editable = false;
+        span.limitation =
+          "This text uses mixed or individually positioned glyph spacing that PDF Folio cannot safely reproduce.";
       }
       elements.push({
         ...span,
@@ -190,6 +242,11 @@ export class PdfEngine {
         pageIndex: index,
       });
       span = null;
+      previousGlyph = undefined;
+      spacingSamples = [];
+      wordSpacingSamples = [];
+      scaleSamples = [];
+      safeFormatting = true;
     };
     text.walk({
       beginLine: (
@@ -213,7 +270,8 @@ export class PdfEngine {
           charCount += 1;
           const rect = quadToRect(quad);
           const colorHex = colorToHex(color);
-          const record = findCapturedFont(capturedGlyphs, character, origin);
+          const captured = findCapturedGlyph(capturedGlyphs, character, origin);
+          const record = captured?.record;
           const baseFontId = suggestedFontId(font.getName());
           const fontId = record?.definition.id ?? baseFontId;
           const exact = Boolean(record || baseFontId);
@@ -222,6 +280,15 @@ export class PdfEngine {
             Math.abs(line.direction[1]) < 0.02 &&
             Math.abs(quad[1] - quad[3]) < 0.5;
           if (span && key === spanKey) {
+            if (captured && previousGlyph) {
+              const gap = captured.x - previousGlyph.x - previousGlyph.advance;
+              if (span.text.endsWith(" ")) wordSpacingSamples.push(gap);
+              else spacingSamples.push(gap);
+            }
+            if (captured) {
+              scaleSamples.push(captured.horizontalScale);
+              safeFormatting &&= captured.safeTransform;
+            }
             span.text += character;
             span.rect = unionRect(span.rect, rect);
           } else {
@@ -242,13 +309,21 @@ export class PdfEngine {
                   : "The original font cannot be safely reused from this PDF. Upload the matching TTF/OTF or explicitly choose a replacement font.",
               fontSize: size,
               baseline: origin[1],
+              horizontalScale: captured?.horizontalScale ?? 1,
+              characterSpacing: 0,
+              wordSpacing: 0,
               color: colorHex,
               editable: horizontal,
               limitation: horizontal
                 ? undefined
                 : "Rotated or vertical text is view-only to avoid damaging its layout.",
             };
+            scaleSamples = captured ? [captured.horizontalScale] : [1];
+            spacingSamples = [];
+            wordSpacingSamples = [];
+            safeFormatting = captured?.safeTransform ?? horizontal;
           }
+          previousGlyph = captured;
         } finally {
           font.destroy();
         }
@@ -354,54 +429,63 @@ export class PdfEngine {
             const candidates = embeddedFonts.filter(
               (candidate) => candidate.fontName === name,
             );
-            if (candidates.length !== 1) return;
             let record = recordsByPointer.get(font.pointer as number);
-            if (!record) {
+            if (!record && candidates.length === 1) {
               const resource = candidates[0];
               const subset = /^[A-Z]{6}\+/.test(name);
-              if (
-                subset &&
-                (!resource.objectNumber || !resource.characterCodes.size)
-              )
-                return;
-              const sequence = this.documentFontSequence++;
-              const key = `document-font-${sequence}`;
-              const definition: FontDefinition = {
-                id: key,
-                family: displayFontName(name),
-                category: "Document original",
-                source: subset
-                  ? "Exact embedded original font subset"
-                  : "Exact embedded original font",
-                documentFontKey: key,
-                exactOriginal: true,
-                subset,
-                coverage: subset
-                  ? "Glyphs embedded in this PDF"
-                  : "Defined by the embedded font",
-              };
-              record = {
-                key,
-                definition,
-                font: new mupdf.Font(font.pointer),
-                glyphs: new Map(),
-                ambiguousGlyphs: new Set(),
-                pdfObjectNumber: resource.objectNumber,
-                characterCodes: resource.characterCodes,
-              };
-              recordsByPointer.set(font.pointer as number, record);
-              this.documentFonts.set(key, record);
+              if (!subset || (resource.objectNumber && resource.characterCodes.size)) {
+                const sequence = this.documentFontSequence++;
+                const key = `document-font-${sequence}`;
+                const definition: FontDefinition = {
+                  id: key,
+                  family: displayFontName(name),
+                  category: "Document original",
+                  source: subset
+                    ? "Exact embedded original font subset"
+                    : "Exact embedded original font",
+                  documentFontKey: key,
+                  exactOriginal: true,
+                  subset,
+                  coverage: subset
+                    ? "Glyphs embedded in this PDF"
+                    : "Defined by the embedded font",
+                };
+                record = {
+                  key,
+                  definition,
+                  font: new mupdf.Font(font.pointer),
+                  glyphs: new Map(),
+                  ambiguousGlyphs: new Set(),
+                  pdfObjectNumber: resource.objectNumber,
+                  characterCodes: resource.characterCodes,
+                };
+                recordsByPointer.set(font.pointer as number, record);
+                this.documentFonts.set(key, record);
+              }
             }
-            const existing = record.glyphs.get(unicode);
-            if (existing !== undefined && existing !== glyph)
-              record.ambiguousGlyphs.add(unicode);
-            else record.glyphs.set(unicode, glyph);
+            if (record) {
+              const existing = record.glyphs.get(unicode);
+              if (existing !== undefined && existing !== glyph)
+                record.ambiguousGlyphs.add(unicode);
+              else record.glyphs.set(unicode, glyph);
+            }
             const point = transformPoint(ctm, transform[4], transform[5]);
+            const xVector = transformVector(ctm, transform[0], transform[1]);
+            const yVector = transformVector(ctm, transform[2], transform[3]);
+            const xLength = Math.hypot(...xVector);
+            const yLength = Math.hypot(...yVector);
+            const horizontalScale = yLength > 0.001 ? xLength / yLength : 1;
             glyphs.push({
               x: point[0],
               y: point[1],
               codePoint: unicode,
               record,
+              advance: font.advanceGlyph(glyph) * xLength,
+              horizontalScale,
+              safeTransform:
+                yLength > 0.001 &&
+                Math.abs(xVector[1]) < Math.max(0.02, xLength * 0.02) &&
+                Math.abs(yVector[0]) < Math.max(0.02, yLength * 0.02),
             });
           } finally {
             font.destroy();
@@ -456,7 +540,10 @@ export class PdfEngine {
   }
 
   async export(operations: EditOperation[]): Promise<Uint8Array> {
-    if (!operations.length) return this.requireBytes().slice();
+    const effectiveOperations = operations.filter(
+      (operation) => !isNoopTextOperation(operation),
+    );
+    if (!effectiveOperations.length) return this.requireBytes().slice();
     const doc = this.openPdf(this.requireBytes());
     try {
       const fonts = this.getFonts();
@@ -472,7 +559,7 @@ export class PdfEngine {
           page.destroy();
         }
       }
-      for (const operation of operations) {
+      for (const operation of effectiveOperations) {
         const page = doc.loadPage(operation.pageIndex) as PDFPage;
         try {
           const transform = page.getTransform();
@@ -574,7 +661,21 @@ export class PdfEngine {
         width,
         operation.fontSize,
         acquired.resolveGlyph,
+        operation,
       );
+      if (operation.noWrap) {
+        const naturalWidth = measureTextWidth(
+          font,
+          operation.text,
+          operation.fontSize,
+          acquired.resolveGlyph,
+          operation,
+        );
+        if (naturalWidth > width + 0.1)
+          throw new Error(
+            "This single line no longer fits its text box. Widen or reposition the box, reduce the font size, or add an explicit line break.",
+          );
+      }
       const lineHeight = operation.fontSize * 1.2;
       const requiredHeight = Math.max(
         operation.fontSize * 1.25,
@@ -610,25 +711,28 @@ export class PdfEngine {
         );
         lines.forEach((line, index) => {
           const baseline = firstBaseline + index * lineHeight;
-          if (definition.documentFontKey) {
-            let x = 0;
-            for (const character of Array.from(line)) {
-              const codePoint = character.codePointAt(0)!;
-              const glyph = acquired.resolveGlyph(character);
-              text.showGlyph(
-                font,
-                [operation.fontSize, 0, 0, -operation.fontSize, x, baseline],
-                glyph,
-                codePoint,
-              );
-              x += font.advanceGlyph(glyph) * operation.fontSize;
-            }
-          } else {
-            text.showString(
+          let x = 0;
+          const horizontalScale = operation.horizontalScale ?? 1;
+          for (const character of Array.from(line)) {
+            const codePoint = character.codePointAt(0)!;
+            const glyph = acquired.resolveGlyph(character);
+            text.showGlyph(
               font,
-              [operation.fontSize, 0, 0, -operation.fontSize, 0, baseline],
-              line,
+              [
+                operation.fontSize * horizontalScale,
+                0,
+                0,
+                -operation.fontSize,
+                x,
+                baseline,
+              ],
+              glyph,
+              codePoint,
             );
+            x +=
+              font.advanceGlyph(glyph) * operation.fontSize * horizontalScale +
+              (operation.characterSpacing ?? 0) +
+              (character === " " ? operation.wordSpacing ?? 0 : 0);
           }
         });
         device.fillText(
@@ -716,7 +820,7 @@ export class PdfEngine {
       "q",
       `${color[0]} ${color[1]} ${color[2]} rg`,
       "BT",
-      "0 Tc 0 Tw 100 Tz 0 Ts 0 Tr",
+      `${(operation.characterSpacing ?? 0) / (operation.horizontalScale ?? 1)} Tc ${(operation.wordSpacing ?? 0) / (operation.horizontalScale ?? 1)} Tw ${(operation.horizontalScale ?? 1) * 100} Tz 0 Ts 0 Tr`,
     ];
     lines.forEach((line, index) => {
       const point = transformPoint(
@@ -1007,7 +1111,11 @@ function transformPoint(matrix: Matrix, x: number, y: number): [number, number] 
   ];
 }
 
-function findCapturedFont(
+function transformVector(matrix: Matrix, x: number, y: number): [number, number] {
+  return [matrix[0] * x + matrix[2] * y, matrix[1] * x + matrix[3] * y];
+}
+
+function findCapturedGlyph(
   glyphs: CapturedGlyph[],
   character: string,
   origin: [number, number],
@@ -1023,7 +1131,55 @@ function findCapturedFont(
       distance = next;
     }
   }
-  return distance < 2 ? best?.record : undefined;
+  return distance < 2 ? best : undefined;
+}
+
+function median(values: number[]) {
+  if (!values.length) return undefined;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function stableSamples(values: number[], tolerance: number) {
+  if (values.length < 2) return true;
+  const center = median(values)!;
+  return values.every((value) => Math.abs(value - center) <= tolerance);
+}
+
+function isNoopTextOperation(operation: EditOperation) {
+  if (
+    operation.kind !== "replace-text" ||
+    operation.sourceText === undefined ||
+    !operation.sourceRect ||
+    operation.sourceFontId === undefined ||
+    operation.sourceFontSize === undefined ||
+    operation.sourceColor === undefined
+  )
+    return false;
+  const sameRect = operation.rect.every(
+    (value, index) => Math.abs(value - operation.sourceRect![index]) < 0.001,
+  );
+  return (
+    sameRect &&
+    operation.text === operation.sourceText &&
+    operation.fontId === operation.sourceFontId &&
+    Math.abs(operation.fontSize - operation.sourceFontSize) < 0.001 &&
+    operation.color.toLowerCase() === operation.sourceColor.toLowerCase() &&
+    Math.abs(
+      (operation.horizontalScale ?? 1) -
+        (operation.sourceHorizontalScale ?? 1),
+    ) < 0.001 &&
+    Math.abs(
+      (operation.characterSpacing ?? 0) -
+        (operation.sourceCharacterSpacing ?? 0),
+    ) < 0.001 &&
+    Math.abs(
+      (operation.wordSpacing ?? 0) - (operation.sourceWordSpacing ?? 0),
+    ) < 0.001
+  );
 }
 
 function layoutLines(
@@ -1032,14 +1188,21 @@ function layoutLines(
   maxWidth: number,
   fontSize: number,
   resolveGlyph: (character: string) => number,
+  format: TextFormatMetrics = {},
 ) {
+  const horizontalScale = format.horizontalScale ?? 1;
+  const characterSpacing = format.characterSpacing ?? 0;
+  const wordSpacing = format.wordSpacing ?? 0;
   const result: string[] = [];
   const measure = (value: string) =>
-    Array.from(value).reduce((width, character) => {
-      const glyph = resolveGlyph(character);
-      return width + font.advanceGlyph(glyph) * fontSize;
-    }, 0);
-  for (const character of Array.from(text)) measure(character);
+    measureTextWidth(font, value, fontSize, resolveGlyph, {
+      horizontalScale,
+      characterSpacing,
+      wordSpacing,
+    });
+  for (const character of Array.from(text))
+    if (character !== "\n") measure(character);
+  if (format.noWrap) return text.split("\n");
   for (const paragraph of text.split("\n")) {
     if (!paragraph) {
       result.push("");
@@ -1063,6 +1226,27 @@ function layoutLines(
     result.push(line);
   }
   return result.length ? result : [""];
+}
+
+function measureTextWidth(
+  font: Font,
+  text: string,
+  fontSize: number,
+  resolveGlyph: (character: string) => number,
+  format: TextFormatMetrics = {},
+) {
+  const horizontalScale = format.horizontalScale ?? 1;
+  const characterSpacing = format.characterSpacing ?? 0;
+  const wordSpacing = format.wordSpacing ?? 0;
+  return Array.from(text).reduce((width, character) => {
+    const glyph = resolveGlyph(character);
+    return (
+      width +
+      font.advanceGlyph(glyph) * fontSize * horizontalScale +
+      characterSpacing +
+      (character === " " ? wordSpacing : 0)
+    );
+  }, 0);
 }
 
 function hexToColor(hex: string): Color {

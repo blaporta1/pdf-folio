@@ -444,6 +444,19 @@ button {
 .text-hit span {
   background: #17867a;
 }
+.text-resize-handle {
+  position: absolute;
+  right: -6px;
+  bottom: -6px;
+  width: 11px;
+  height: 11px;
+  border: 2px solid #fff;
+  border-radius: 2px;
+  background: #17867a;
+  box-shadow: 0 0 0 1px #17867a;
+  cursor: nwse-resize;
+  touch-action: none;
+}
 .image-hit:hover,
 .image-hit.selected {
   border-color: #b07b37;
@@ -462,6 +475,10 @@ button {
   border: 1px solid #fff;
   background: currentColor;
   box-shadow: 0 0 0 1px currentColor;
+  pointer-events: none;
+}
+.text-hit.selected:after {
+  display: none;
 }
 .object-hit.locked {
   border-style: dashed;
@@ -522,6 +539,11 @@ button {
 .position-grid input:focus {
   border-color: #5b8b84;
   box-shadow: 0 0 0 2px #5b8b8422;
+}
+.field textarea {
+  min-height: 132px;
+  resize: vertical;
+  line-height: 1.45;
 }
 .select-wrap {
   position: relative;

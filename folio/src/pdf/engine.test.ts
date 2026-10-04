@@ -126,7 +126,90 @@ function sampleRgb(bytes: Uint8Array, rect: [number, number, number, number]) {
   return rgb;
 }
 
+function renderedPixels(bytes: Uint8Array) {
+  const document = mupdf.Document.openDocument(bytes, "application/pdf").asPDF()!;
+  const page = document.loadPage(0);
+  const pixmap = page.toPixmap(
+    mupdf.Matrix.identity,
+    mupdf.ColorSpace.DeviceRGB,
+    false,
+    true,
+  );
+  const result = {
+    width: pixmap.getWidth(),
+    height: pixmap.getHeight(),
+    stride: pixmap.getStride(),
+    components: pixmap.getNumberOfComponents(),
+    pixels: new Uint8Array(pixmap.getPixels()).slice(),
+  };
+  pixmap.destroy();
+  page.destroy();
+  document.destroy();
+  return result;
+}
+
+function differencesOutsideRect(
+  before: ReturnType<typeof renderedPixels>,
+  after: ReturnType<typeof renderedPixels>,
+  rect: [number, number, number, number],
+) {
+  expect(after.width).toBe(before.width);
+  expect(after.height).toBe(before.height);
+  let differences = 0;
+  for (let y = 0; y < before.height; y += 1) {
+    for (let x = 0; x < before.width; x += 1) {
+      if (x >= rect[0] - 2 && x <= rect[2] + 2 && y >= rect[1] - 2 && y <= rect[3] + 2)
+        continue;
+      const offset = y * before.stride + x * before.components;
+      for (let channel = 0; channel < 3; channel += 1)
+        if (before.pixels[offset + channel] !== after.pixels[offset + channel]) {
+          differences += 1;
+          break;
+        }
+    }
+  }
+  return differences;
+}
+
 describe("PdfEngine export regressions", () => {
+  it("returns the original bytes for an unchanged text Apply", async () => {
+    const sourceBytes = bytesAt(fixturePath);
+    const engine = new PdfEngine();
+    const model = await engine.open(sourceBytes, "engine-fixture.pdf");
+    const source = model.pages[0].elements.find(
+      (element): element is TextElement =>
+        element.kind === "text" && element.text.includes("Editable phrase"),
+    )!;
+    expect(source.fontId).toBeTruthy();
+    const output = await engine.export([
+      {
+        id: "no-op",
+        kind: "replace-text",
+        pageIndex: 0,
+        sourceId: source.id,
+        sourceRect: source.rect,
+        rect: [...source.rect],
+        baseline: source.baseline,
+        sourceText: source.text,
+        sourceFontId: source.fontId,
+        sourceFontSize: source.fontSize,
+        sourceColor: source.color,
+        sourceHorizontalScale: source.horizontalScale,
+        sourceCharacterSpacing: source.characterSpacing,
+        sourceWordSpacing: source.wordSpacing,
+        text: source.text,
+        fontId: source.fontId!,
+        fontName: source.fontName,
+        fontSize: source.fontSize,
+        color: source.color,
+        horizontalScale: source.horizontalScale,
+        characterSpacing: source.characterSpacing,
+        wordSpacing: source.wordSpacing,
+      },
+    ]);
+    expect(Buffer.from(output).equals(Buffer.from(sourceBytes))).toBe(true);
+  });
+
   it("indexes local fonts lazily and refuses ambiguous PostScript-name matches", async () => {
     const bytes = bytesAt(resolve("public/fonts/Inter.ttf"));
     const firstFile = new File([bytes], "Inter.ttf", { lastModified: 1 });
@@ -149,9 +232,26 @@ describe("PdfEngine export regressions", () => {
     ).toBeUndefined();
     const engine = new PdfEngine();
     expect(engine.addFonts([first, second])).toBe(2);
+    const model = await engine.open(bytesAt(fixturePath), "engine-fixture.pdf");
     await expect(
       engine.validateText(first.id, "Browser local font", 240, 14),
     ).resolves.toBeTruthy();
+    const [x0, y0] = model.pages[0].bounds;
+    const output = await engine.export([
+      {
+        id: "lazy-local-font",
+        kind: "add-text",
+        pageIndex: 0,
+        rect: [x0 + 60, y0 + 400, x0 + 300, y0 + 422],
+        baseline: y0 + 417,
+        text: "Browser local font",
+        fontId: first.id,
+        fontName: first.family,
+        fontSize: 14,
+        color: "#202725",
+      },
+    ]);
+    expect(textFrom(output)).toContain("Browser local font");
   });
 
   it("rejects local fonts whose OS/2 metadata forbids PDF embedding", async () => {
@@ -284,6 +384,206 @@ describe("PdfEngine export regressions", () => {
     )!;
     expect(moved.rect[0]).toBeGreaterThan(source.rect[0] + 170);
     expect(moved.rect[1]).toBeGreaterThan(source.rect[1] + 35);
+  });
+
+  it("uses a widened target box without widening the source redaction", async () => {
+    const sourceBytes = bytesAt(fixturePath);
+    const engine = new PdfEngine();
+    const model = await engine.open(sourceBytes, "engine-fixture.pdf");
+    const source = model.pages[0].elements.find(
+      (element): element is TextElement =>
+        element.kind === "text" && element.text.includes("Editable phrase"),
+    )!;
+    const target: [number, number, number, number] = [
+      source.rect[0],
+      source.rect[1],
+      source.rect[2] + 150,
+      source.rect[3],
+    ];
+    const output = await engine.export([
+      {
+        id: "wider-text",
+        kind: "replace-text",
+        pageIndex: 0,
+        sourceId: source.id,
+        sourceRect: source.rect,
+        rect: target,
+        baseline: source.baseline,
+        text: "A longer replacement fits this wider box",
+        fontId: source.fontId!,
+        fontName: source.fontName,
+        fontSize: source.fontSize,
+        color: source.color,
+        horizontalScale: source.horizontalScale,
+        characterSpacing: source.characterSpacing,
+        wordSpacing: source.wordSpacing,
+      },
+    ]);
+    expect(textFrom(output)).toContain("A longer replacement fits this wider box");
+    expect(textFrom(output)).toContain("Untouched anchor text");
+    expect(
+      differencesOutsideRect(renderedPixels(sourceBytes), renderedPixels(output), target),
+    ).toBe(0);
+  });
+
+  it("captures and preserves safe horizontal scale and character spacing", async () => {
+    const engine = new PdfEngine();
+    const model = await engine.open(bytesAt(fixturePath), "engine-fixture.pdf");
+    const source = model.pages[0].elements.find(
+      (element): element is TextElement =>
+        element.kind === "text" && element.text.includes("Scaled spacing"),
+    )!;
+    expect(source.editable).toBe(true);
+    expect(source.horizontalScale).toBeCloseTo(0.8, 2);
+    expect(source.characterSpacing).toBeCloseTo(1, 1);
+    const output = await engine.export([
+      {
+        id: "scaled-text",
+        kind: "replace-text",
+        pageIndex: 0,
+        sourceId: source.id,
+        sourceRect: source.rect,
+        rect: [source.rect[0], source.rect[1], source.rect[2] + 40, source.rect[3]],
+        baseline: source.baseline,
+        text: "Scaled safely",
+        fontId: source.fontId!,
+        fontName: source.fontName,
+        fontSize: source.fontSize,
+        color: source.color,
+        horizontalScale: source.horizontalScale,
+        characterSpacing: source.characterSpacing,
+        wordSpacing: source.wordSpacing,
+      },
+    ]);
+    const reopened = new PdfEngine();
+    const changed = await reopened.open(output, "scaled.pdf");
+    const replacement = changed.pages[0].elements.find(
+      (element): element is TextElement =>
+        element.kind === "text" && element.text.includes("Scaled safely"),
+    )!;
+    expect(replacement.horizontalScale).toBeCloseTo(0.8, 2);
+    expect(replacement.characterSpacing).toBeCloseTo(1, 1);
+  });
+
+  it("keeps repeated single-line revisions on the original baseline while the target only grows", async () => {
+    const engine = new PdfEngine();
+    const model = await engine.open(bytesAt(fixturePath), "engine-fixture.pdf");
+    const source = model.pages[0].elements.find(
+      (element): element is TextElement =>
+        element.kind === "text" && element.text.includes("Editable phrase"),
+    )!;
+    const manualWidth = source.rect[2] - source.rect[0] + 24;
+    let width = manualWidth;
+    const observedWidths: number[] = [];
+    for (const [index, replacement] of [
+      "Short",
+      "A substantially longer replacement",
+      "A substantially longer replacement reviewed again",
+      "Short again",
+    ].entries()) {
+      const validation = await engine.validateText(
+        source.fontId!,
+        replacement,
+        width,
+        source.fontSize,
+        {
+          horizontalScale: source.horizontalScale,
+          characterSpacing: source.characterSpacing,
+          wordSpacing: source.wordSpacing,
+          noWrap: true,
+        },
+      );
+      width = Math.max(width, validation.naturalWidth + 0.5);
+      observedWidths.push(width);
+      const output = await engine.export([
+        {
+          id: `revision-${index}`,
+          kind: "replace-text",
+          pageIndex: 0,
+          sourceId: source.id,
+          sourceRect: source.rect,
+          rect: [source.rect[0], source.rect[1], source.rect[0] + width, source.rect[3]],
+          baseline: source.baseline,
+          sourceText: source.text,
+          sourceFontId: source.fontId,
+          sourceFontSize: source.fontSize,
+          sourceColor: source.color,
+          text: replacement,
+          fontId: source.fontId!,
+          fontName: source.fontName,
+          fontSize: source.fontSize,
+          color: source.color,
+          horizontalScale: source.horizontalScale,
+          characterSpacing: source.characterSpacing,
+          wordSpacing: source.wordSpacing,
+          noWrap: true,
+        },
+      ]);
+      const reopened = new PdfEngine();
+      const changed = await reopened.open(output, `revision-${index}.pdf`);
+      const matches = changed.pages[0].elements.filter(
+        (element): element is TextElement =>
+          element.kind === "text" && element.text === replacement,
+      );
+      expect(matches).toHaveLength(1);
+      expect(matches[0].baseline).toBeCloseTo(source.baseline, 1);
+    }
+    expect(observedWidths[0]).toBe(manualWidth);
+    expect(observedWidths[1]).toBeGreaterThan(observedWidths[0]);
+    expect(observedWidths[2]).toBeGreaterThan(observedWidths[1]);
+    expect(observedWidths[3]).toBe(observedWidths[2]);
+  });
+
+  it("rejects single-line overflow instead of wrapping, while explicit newlines remain multiline", async () => {
+    const engine = new PdfEngine();
+    const model = await engine.open(bytesAt(fixturePath), "engine-fixture.pdf");
+    const source = model.pages[0].elements.find(
+      (element): element is TextElement =>
+        element.kind === "text" && element.text.includes("Editable phrase"),
+    )!;
+    const format = {
+      horizontalScale: source.horizontalScale,
+      characterSpacing: source.characterSpacing,
+      wordSpacing: source.wordSpacing,
+    };
+    await expect(
+      engine.export([
+        {
+          id: "overflow",
+          kind: "replace-text",
+          pageIndex: 0,
+          sourceRect: source.rect,
+          rect: source.rect,
+          baseline: source.baseline,
+          text: "This replacement deliberately cannot fit in the original narrow rectangle",
+          fontId: source.fontId!,
+          fontName: source.fontName,
+          fontSize: source.fontSize,
+          color: source.color,
+          ...format,
+          noWrap: true,
+        },
+      ]),
+    ).rejects.toThrow(/single line no longer fits/i);
+
+    const output = await engine.export([
+      {
+        id: "explicit-lines",
+        kind: "replace-text",
+        pageIndex: 0,
+        sourceRect: source.rect,
+        rect: [source.rect[0], source.rect[1], source.rect[0] + 160, source.rect[1] + 40],
+        baseline: source.baseline,
+        text: "First line\nSecond line",
+        fontId: source.fontId!,
+        fontName: source.fontName,
+        fontSize: source.fontSize,
+        color: source.color,
+        ...format,
+        noWrap: false,
+      },
+    ]);
+    expect(textFrom(output)).toContain("First line\nSecond line");
   });
 
   it("replaces one repeated image instance without changing the other instance", async () => {
